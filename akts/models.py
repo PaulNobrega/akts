@@ -50,6 +50,45 @@ def f_sb_mn(alpha: float, params: Dict = {'m': 0.5, 'n': 1.0}) -> float:
     if not np.isfinite(result): return 0.0
     return max(0.0, result)
 
+def f_sb_sum(alpha, c1, m1, n1, m2, n2):
+    """
+    Calculates the Sestak-Berggren (SB) sum model f(alpha).
+    f(alpha) = c1 * alpha^m1 * (1-alpha)^n1 + (1-c1) * alpha^m2 * (1-alpha)^n2
+    Handles scalar or array inputs for alpha. Robust against edge cases.
+    """
+    alpha_arr = np.asarray(alpha)
+    # Use a small epsilon to avoid exact 0 or 1 in exponent bases
+    eps = 1e-12
+    alpha_base = np.maximum(eps, alpha_arr)
+    one_minus_alpha_base = np.maximum(eps, 1.0 - alpha_arr)
+
+    # Calculate terms, handle potential issues if exponents are extreme
+    try:
+        term1 = c1 * (alpha_base**m1) * (one_minus_alpha_base**n1)
+    except (OverflowError, ValueError):
+        term1 = np.inf  # Penalize if calculation fails
+
+    try:
+        c2 = 1.0 - c1
+        term2 = c2 * (alpha_base**m2) * (one_minus_alpha_base**n2)
+    except (OverflowError, ValueError):
+        term2 = np.inf  # Penalize if calculation fails
+
+    f_alpha_arr = term1 + term2
+
+    # Clean up potential numerical issues AFTER summation
+    # Replace NaN/Inf with a large number to penalize in optimizer, but not zero
+    f_alpha_final = np.nan_to_num(f_alpha_arr, nan=1e6, posinf=1e6, neginf=-1e6)
+
+    # Ensure non-negative (physical constraint) - do this LAST
+    f_alpha_final = np.maximum(f_alpha_final, 0.0)
+
+    # Return result matching the input type
+    if np.isscalar(alpha):
+        return f_alpha_final.item()
+    else:
+        return f_alpha_final
+
 # --- Registry of f(alpha) models ---
 F_ALPHA_MODELS: Dict[str, FAlphaCallable] = {
     "F1": f_n_order, # Pass function directly
@@ -58,14 +97,15 @@ F_ALPHA_MODELS: Dict[str, FAlphaCallable] = {
     "A2": f_avrami_n,
     "A3": f_avrami_n,
     "SB_mn": f_sb_mn,
+    "SB_sum": f_sb_sum,  # Added the new model
 }
 # Store default parameters separately if needed by get_model_info
 F_ALPHA_DEFAULT_PARAMS = {
     "F1": {'n': 1.0}, "F2": {'n': 2.0}, "F3": {'n': 3.0},
     "A2": {'n': 2.0}, "A3": {'n': 3.0},
     "SB_mn": {'m': 0.5, 'n': 1.0},
+    "SB_sum": {'c1': 0.5, 'm1': 0.5, 'n1': 1.0, 'm2': 0.5, 'n2': 1.0},  # Default parameters for SB_sum
 }
-
 
 # --- ODE System Definitions (Pure Python) ---
 def ode_system_single_step(t: float, y: np.ndarray, T_func: Callable, params: Dict) -> np.ndarray:
