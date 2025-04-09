@@ -1526,18 +1526,29 @@ def run_full_analysis_sb_sum(
         final_result.isoconversional_result = iso_result
         print(f"Isoconversional analysis complete using {iso_result.method}. Found Ea for {len(iso_result.alpha)} alpha values.")
         ea_interpolator = create_ea_interpolator(iso_result.alpha, iso_result.Ea)
+
+        # Calculate average Ea and create a constant interpolator
+        valid_ea_values = iso_result.Ea[np.isfinite(iso_result.Ea)]
+        if len(valid_ea_values) > 0:
+            average_ea = np.mean(valid_ea_values)
+            print(f"Using average Ea = {average_ea / 1000:.1f} kJ/mol for fitting.")
+            ea_interpolator = lambda alpha: average_ea  # Constant interpolator
+        else:
+            print("Error: Could not calculate average Ea.")
+            return None
+
     except Exception as e_iso:
         print(f"Error during Isoconversional Analysis: {e_iso}")
         traceback.print_exc()
         return None
 
     # --- Step 2: Model Fitting ---
-    print("\nStep 2: Fitting SB Sum model using Ea(alpha)...")
+    print("\nStep 2: Fitting SB Sum model using constant Ea...")
     fit_params_dict = None
     try:
         fit_params_dict, fit_cov = fit_sb_sum_model_ea_variable(
             experimental_runs,
-            ea_interpolator,
+            ea_interpolator,  # Pass the constant interpolator
             initial_params=initial_params_sb
         )
         if fit_params_dict is None:
