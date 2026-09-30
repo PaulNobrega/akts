@@ -8,7 +8,7 @@ AKTS is a Python library for Arrhenius Kinetics Thermal Simulations. It analyzes
 
 ![Multi-temperature experimental data and fitted model](Examples/Isothermal/output/data_multi_temperature.png)
 
-## **[View example isothermal stability report](https://htmlpreview.github.io/?https://raw.githubusercontent.com/PaulNobrega/akts/main/Examples/Isothermal/output/isothermal_stability_report.html)**
+## **[View rendered example isothermal stability report](https://raw.githack.com/PaulNobrega/akts/main/Examples/Isothermal/output/isothermal_stability_report.html)**
 ### Documentation
 
 **[Complete Documentation](docs/README.md)**
