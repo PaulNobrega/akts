@@ -21,29 +21,49 @@ results = auto_model_isothermal_data(
     filter_implausible=False,      # Exclude models with unrealistic parameters
     input_temperature_units='K',   # 'K', 'C', or 'F'
     output_temperature_units='K',
+    shelf_life_temperature_C=20.0,
+    shelf_life_target_conversion=0.05,
+    shelf_life_confidence_level=0.95,
+    shelf_life_is_long_term=True,
+    shelf_life_nonlinearity_p_threshold=0.05,
     report_path='report.html',
     output_format='dict',          # 'dict', 'json', or 'both'
     bootstrap_iterations=100,
+    bootstrap_method='monte_carlo',
     n_jobs=-1,                     # Bootstrap workers: all but one CPU core
     progress_callback=None
 )
 ```
 
-`models_to_try=None` (the default) uses `models.default` (12 kinetic models),
-plus `'Friedman'` model-free analysis if the data spans at least three distinct
+`models_to_try=None` (the default) uses `models.default` (12 kinetic models).
+Friedman is not added automatically; include `'Friedman'` in `models_to_try` to
+select it. A meaningful Friedman fit requires at least three distinct
 temperatures. To include ODE or empirical models, pass a selector list such as
 `models.default + models.ode.all`. See
 [Model-free prediction](#model-free-prediction-no-reaction-model-assumed) below
 and [automated_analysis.md](automated_analysis.md#model-selection) for details.
 
+When `predict` is provided, the report also attempts a shelf-life estimate at
+`shelf_life_temperature_C` (default 20°C), independently of the prediction
+temperature. It uses `shelf_life_target_conversion` (default 5% degradation),
+the one-sided `shelf_life_confidence_level` (default 95%), and the selected
+long-term/accelerated ceiling formula. For each batch, a nested F-test compares
+linear and quadratic time trends; quadratic is selected when its p-value is below
+`shelf_life_nonlinearity_p_threshold` (default 0.05). If all batch trends are
+linear, ANCOVA tests common-slope pooling at α=0.25. Usable observations must be
+within 0.5 K of the shelf-life temperature; otherwise no estimate is returned.
+These automatic trend choices are diagnostics and do not by themselves establish
+regulatory compliance.
+
 ## Core Functions
 
 ### fit_kinetic_model()
 
-Fit a single model to data. Performance optimizations include:
-- **Closed-form solutions** for isothermal data (F0-D4 models): 3-5× speedup
-- **Numba JIT-compiled ODE integration** for non-isothermal data: 2-5× speedup
-- **Combined potential**: Up to 10-15× faster depending on your data
+Fit a single model to data. Isothermal data with a closed-form model (F0-F3,
+A2, A3, R2, R3, D2-D4) is fitted directly with `least_squares`. Everything else is
+integrated with `solve_ivp` (LSODA by default, RK45 fallback). See
+[Numerical Solvers and Performance](advanced_usage.md#numerical-solvers-and-performance)
+for `solver_options`.
 
 ```python
 from akts import fit_kinetic_model
@@ -53,7 +73,9 @@ fit_result = fit_kinetic_model(
     model_name,                    # 'single_step', 'A->B->C', 'A+B->C'
     model_definition_args,         # See Model Parameters below
     initial_guesses,               # Dict[str, float]
-    parameter_bounds=None
+    parameter_bounds=None,
+    solver_options=None,           # e.g. {'primary_solver': 'BDF', 'fallback_solver': 'Radau'}
+    optimizer_options=None,        # e.g. {'method': 'Powell', 'max_seconds': 120}
 )
 ```
 
@@ -102,9 +124,72 @@ if __name__ == '__main__':  # Required on Windows!
         optimizer_options={'method': 'L-BFGS-B'},
         parameter_bounds={'Ea': (50000, 150000), 'A': (1e7, 1e14)},
         n_iterations=100,
-        n_jobs=-1  # Use all but one CPU core
+        bootstrap_method='monte_carlo',
+        n_jobs=-1,            # Use all but one CPU core
+        random_state=12345,   # Optional: reproducible resampling
     )
 ```
+
+`bootstrap_method` accepts three strategies and defaults to `monte_carlo`:
+
+- **`monte_carlo`** (case bootstrap): sample complete `(time, temperature,
+    conversion)` rows with replacement within each dataset, keeping its row count.
+    Some observed times may be omitted and others repeated, so this can be unstable
+    for very sparse datasets.
+- **`parametric`**: add independent Gaussian conversion errors around the fitted
+    curves, using residual standard deviations estimated per dataset (with a pooled
+    estimate when a dataset has too few finite residuals), then refit.
+- **`residual`**: add centered residuals sampled with replacement from the
+    pooled residuals, weighted toward the conversion-transition region, then refit.
+
+Each replicate is refit with the same model and optimizer. `BootstrapResult`
+records the chosen method in `bootstrap_method`. The specialized helpers
+`run_bootstrap_empirical()` and `run_bootstrap_friedman()` are also exported from
+`akts` and accept the same option; Friedman reruns its isoconversional regressions
+on each synthetic dataset.
+
+For an empirical fit, call its specialized helper directly:
+
+```python
+from akts import run_bootstrap_empirical
+
+bootstrap_result = run_bootstrap_empirical(
+    datasets,
+    empirical_fit_result,
+    n_iterations=200,
+    confidence_level=0.95,
+    bootstrap_method='residual',
+    random_state=12345,
+)
+```
+
+For Friedman, pass the `IsoResult` stored on the Friedman fit:
+
+```python
+from akts import run_bootstrap_friedman
+
+iso_result = friedman_fit_result.model_definition_args['iso_result']
+bootstrap_result = run_bootstrap_friedman(
+    datasets,
+    iso_result,
+    n_iterations=200,
+    confidence_level=0.95,
+    bootstrap_method='monte_carlo',
+    random_state=12345,
+)
+```
+
+The selected method is available as `bootstrap_result.bootstrap_method` and is
+included in bootstrap JSON serialization.
+
+The shelf-life estimate in `auto_model_isothermal_data()` is separate from these
+bootstrap methods. At `shelf_life_temperature_C`, it selects a linear or quadratic
+time trend per batch using a nested F-test (`p < shelf_life_nonlinearity_p_threshold`).
+When all batches are linear, slope poolability is tested by ANCOVA at α=0.25;
+otherwise batch trends are kept separate. Increasing degradation uses a one-sided
+upper confidence limit to find the conservative time to the target conversion.
+No bootstrap is used for this estimate, and the automatic trend choice alone does
+not establish regulatory compliance.
 
 ### predict_conversion()
 
@@ -129,11 +214,13 @@ prediction = predict_conversion(
 ### time_to_conversion()
 
 Inverse of `predict_conversion()`: given a fitted model and a fixed storage
-temperature, find the time to reach a target conversion fraction (e.g. "time to
-5% degradation" for ICH Q1E-style shelf-life questions). Optionally propagates a
-confidence interval from a `bootstrap_result`.
+temperature, find the time to reach a target conversion fraction. Optionally
+propagates a confidence interval from a `bootstrap_result` for model-based
+prediction uncertainty. This generic utility is not the ICH Q1E shelf-life
+calculation.
 
-The `one_sided_ci` parameter supports one-sided confidence intervals for ICH Q1E analyses.
+The `one_sided_ci` parameter changes the bootstrap time-interval calculation to
+a one-sided limit; it does not make the result an ICH Q1E analysis.
 
 ```python
 from akts import time_to_conversion
@@ -145,23 +232,29 @@ result = time_to_conversion(
     bootstrap_result=bootstrap_result,  # Optional, adds time_lower_sec/time_upper_sec
     max_search_time_sec=None,     # Optional override of the search window
     n_eval_points=500,            # Points simulated across the search window
-    one_sided_ci=False            # If True, use one-sided 95% lower bound (ICH Q1E)
+    one_sided_ci=False            # Optional one-sided bootstrap time interval
 )
 
 print(f"Time to 5% degradation: {result['time_sec'] / 86400:.1f} days")
 # result also has 'time_lower_sec' and 'time_upper_sec' (None if no bootstrap_result
 # was given, or if a bound was never reached within the search window)
 
-# For ICH Q1E regulatory submissions (more conservative):
+# For a one-sided model-based bootstrap time interval:
 result_regulatory = time_to_conversion(
     fit_result=fit_result,
     target_conversion=0.05,
     temperature_K=298.15,
     bootstrap_result=bootstrap_result,
-    one_sided_ci=True  # Use one-sided 95% lower bound (conservative)
+    one_sided_ci=True  # Use one-sided 95% lower bound on bootstrap crossing times
 )
 # With one_sided_ci=True, time_upper_sec is None
 ```
+
+`auto_model_isothermal_data()` computes its shelf-life trend result separately:
+it selects linear or quadratic time trends with a nested F-test and uses ANCOVA
+for common-slope pooling when all batch trends are linear. It does not use
+`time_to_conversion()` or bootstrap resampling for this result; automated trend
+selection is not itself a determination of regulatory compliance.
 
 Returns a dict with `time_sec`, `time_lower_sec`, `time_upper_sec` (all `Optional[float]`,
 `None` if the target conversion is never reached within the search window). When `one_sided_ci=True`,

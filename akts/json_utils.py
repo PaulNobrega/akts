@@ -3,7 +3,7 @@ JSON utilities for AKTS library - serialization and deserialization of kinetic d
 """
 import numpy as np
 import json
-from typing import Dict, Any, List, Union
+from typing import Dict, Any, List, Optional, Union
 from pathlib import Path
 from .datatypes import KineticDataset, FitResult, BootstrapResult, PredictionResult
 
@@ -111,7 +111,17 @@ def dataset_to_json(dataset: KineticDataset) -> Dict:
     }
 
 
-def fit_result_to_json(fit_result: FitResult) -> Dict:
+def _optional_float(value: Optional[float]) -> Optional[float]:
+    """Converts a possibly-None numeric field to float, passing None through.
+
+    FitResult's r_squared/aic/bic default to None (e.g. every early-return
+    failure path in fit_kinetic_model() leaves them unset), so a bare
+    float(...) call on these fields raises TypeError for unsuccessful fits.
+    """
+    return None if value is None else float(value)
+
+
+def fit_result_to_json(fit_result: FitResult) -> Dict[str, Any]:
     """
     Convert FitResult to JSON-serializable dictionary.
 
@@ -125,15 +135,15 @@ def fit_result_to_json(fit_result: FitResult) -> Dict:
     Dict
         JSON-serializable dictionary with fit parameters and statistics
     """
-    result = {
+    result: Dict[str, Any] = {
         'success': fit_result.success,
         'message': fit_result.message,
         'parameters': convert_numpy_to_python(fit_result.parameters),
         'param_std_err': convert_numpy_to_python(fit_result.param_std_err) if fit_result.param_std_err else None,
-        'rss': float(fit_result.rss),
-        'r_squared': float(fit_result.r_squared),
-        'aic': float(fit_result.aic),
-        'bic': float(fit_result.bic),
+        'rss': _optional_float(fit_result.rss),
+        'r_squared': _optional_float(fit_result.r_squared),
+        'aic': _optional_float(fit_result.aic),
+        'bic': _optional_float(fit_result.bic),
         'n_datapoints': int(fit_result.n_datapoints),
         'n_parameters': int(fit_result.n_parameters),
         'model_name': fit_result.model_name,
@@ -164,21 +174,17 @@ def prediction_to_json(prediction: PredictionResult) -> Dict:
     Dict
         JSON-serializable dictionary
     """
-    result = {
+    result: Dict[str, Any] = {
         'time': prediction.time.tolist(),
         'conversion': prediction.conversion.tolist(),
     }
 
+    if prediction.temperature is not None:
+        result['temperature'] = np.asarray(prediction.temperature).tolist()
+
     if prediction.conversion_ci is not None:
         result['conversion_lower'] = prediction.conversion_ci[0].tolist()
         result['conversion_upper'] = prediction.conversion_ci[1].tolist()
-
-    if prediction.temperature_program is not None:
-        if isinstance(prediction.temperature_program, tuple):
-            result['temperature_program'] = {
-                'time': prediction.temperature_program[0].tolist(),
-                'temperature': prediction.temperature_program[1].tolist()
-            }
 
     return result
 
@@ -202,6 +208,7 @@ def bootstrap_to_json(bootstrap: BootstrapResult) -> Dict:
         'parameter_ci': convert_numpy_to_python(bootstrap.parameter_ci),
         'n_iterations': int(bootstrap.n_iterations),
         'confidence_level': float(bootstrap.confidence_level),
+        'bootstrap_method': bootstrap.bootstrap_method,
         'median_parameters': convert_numpy_to_python(bootstrap.median_parameters)
     }
 

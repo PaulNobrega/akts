@@ -24,6 +24,7 @@ Complete documentation for the AKTS Python library for kinetic analysis.
 
 ### Technical Details
 - **[Multistart Fitting Explained](bayesian_optimization.md)** - How ODE models are fit reliably
+- **[Numerical Solvers and Performance](advanced_usage.md#numerical-solvers-and-performance)** - Choosing primary/fallback ODE solvers, closed-form fast path, reproducible bootstraps
 - **[Temperature Unit Conversion](temperature_units.md)** - Working with K, °C, and °F
 - **[Troubleshooting](troubleshooting.md)** - Common issues and solutions
 

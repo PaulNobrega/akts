@@ -119,12 +119,11 @@ results = auto_model_isothermal_data(
 )
 ```
 
-Friedman model-free isoconversional analysis is added automatically when the
-datasets have at least three distinct mean temperatures, rounded to the nearest
-kelvin. This also applies when `models_to_try` is supplied. With fewer than
-three temperatures, Friedman is omitted unless explicitly named in
-`models_to_try`; if requested, it is attempted but may not produce a valid fit.
-Its conversion levels adapt to the conversion range in the data. See
+Friedman model-free isoconversional analysis is never added automatically;
+include `'Friedman'` explicitly in `models_to_try` to select it. A meaningful
+fit requires at least three distinct mean temperatures, rounded to the nearest
+kelvin, and sufficient overlapping conversion range. Its conversion levels
+adapt to the conversion range in the data. See
 [Model-free prediction](api_reference.md#model-free-prediction-no-reaction-model-assumed).
 
 See the [Model Selector Guide](model_selector.md) for available model groups and

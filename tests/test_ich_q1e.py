@@ -1,12 +1,13 @@
 """
-Tests for ICH Q1E regulatory compliance features.
+Tests for ICH Q1E regression/ANCOVA regulatory reporting.
 
-Tests one-sided CI calculation, ICH extrapolation ceiling, regulatory
-section HTML generation, and integration with auto_model_isothermal_data.
+Also tests the separate generic bootstrap time-to-conversion utility; that
+one-sided interval is not used for the ICH Q1E calculation.
 """
 
 import numpy as np
 import pytest
+import inspect
 from pathlib import Path
 import tempfile
 
@@ -16,7 +17,11 @@ from akts import (
     run_bootstrap,
     auto_model_isothermal_data
 )
-from akts.helpers import time_to_conversion, calculate_ich_q1e_ceiling
+from akts.helpers import (
+    time_to_conversion,
+    calculate_ich_q1e_ceiling,
+    _calculate_shelf_life_trend,
+)
 from akts.reporting import _create_regulatory_section_html
 
 
@@ -97,7 +102,7 @@ class TestOneSidedConfidenceInterval:
             one_sided_ci=False
         )
 
-        # One-sided CI (ICH Q1E)
+        # Generic one-sided bootstrap interval; not the ICH Q1E path.
         result_one_sided = time_to_conversion(
             fit_result=fit_result,
             target_conversion=0.05,
@@ -187,14 +192,14 @@ class TestRegulatoryHTML:
         html = _create_regulatory_section_html(regulatory_data)
 
         # Check key elements are present
-        assert 'ICH Q1E Regulatory Analysis' in html
+        assert 'Shelf-Life Regression Analysis' in html
         assert '18.5 months' in html
         assert '15.2 months' in html
         assert '5%' in html
         assert '25°C' in html  # 298.15K = 25°C
         assert '12 months' in html
         assert '24 months' in html
-        assert 'Within ICH Q1E guidelines' in html
+        assert 'within the configured extrapolation ceiling' in html
         assert 'info-btn' in html
         assert 'showICHInfo()' in html
 
@@ -212,14 +217,21 @@ class TestRegulatoryHTML:
 
         html = _create_regulatory_section_html(regulatory_data)
 
-        # Should show warning
-        assert 'warning' in html
-        assert 'exceeds ICH Q1E ceiling' in html
-        assert 'additional stability data needed' in html.lower()
+        # Should show a ceiling warning without claiming full compliance.
+        assert 'exceeds the configured extrapolation ceiling' in html
+        assert 'selected trend' in html
+        assert 'does not by itself establish regulatory compliance' in html
+        assert 'further review is needed' in html.lower()
 
 
 class TestAutoModelIntegration:
     """Test ICH Q1E integration with auto_model_isothermal_data."""
+
+    def test_shelf_life_defaults_are_twenty_celsius_and_95_percent(self):
+        parameters = inspect.signature(auto_model_isothermal_data).parameters
+        assert parameters['shelf_life_temperature_C'].default == 20.0
+        assert parameters['shelf_life_confidence_level'].default == 0.95
+        assert parameters['shelf_life_target_conversion'].default == 0.05
 
     def test_regulatory_section_included(self):
         """Test regulatory section is automatically included in reports."""
@@ -231,7 +243,6 @@ class TestAutoModelIntegration:
             t = np.linspace(0, 7200, 30)
             k = 1e11 * np.exp(-85000 / (8.314 * temp))
             alpha = 1.0 - np.exp(-k * t)
-            alpha += np.random.normal(0, 0.005, len(t))
             alpha = np.clip(alpha, 0, 1)
             datasets.append(KineticDataset(time=t, temperature=np.full_like(t, temp), conversion=alpha))
 
@@ -244,10 +255,16 @@ class TestAutoModelIntegration:
                 data_files=datasets,
                 predict=(1, 'year'),
                 predict_temperature_K=298.15,
+                shelf_life_temperature_C=25.0,
                 models_to_try=['F1', 'F2'],
-                bootstrap_iterations=10,
+                bootstrap_iterations=0,
                 report_path=str(report_path)
             )
+
+            assert results['summary']['bootstrap_iterations'] == 0
+            assert results['regulatory'] is not None
+            assert results['summary']['shelf_life_temperature_C'] == 25.0
+            assert results['regulatory']['shelf_life_confidence_level'] == 0.95
 
             # Check report was generated
             assert report_path.exists(), "Report should be generated"
@@ -257,9 +274,11 @@ class TestAutoModelIntegration:
                 html_content = f.read()
 
             # Verify regulatory section is present
-            assert 'ICH Q1E Regulatory Analysis' in html_content
+            assert 'Shelf-Life Regression Analysis' in html_content
             assert 'Shelf-Life Estimate' in html_content
             assert 'ICH Q1E Extrapolation Ceiling' in html_content
+            assert 'Trend:' in html_content
+            assert 'does not by itself establish regulatory compliance' in html_content
             assert 'showICHInfo()' in html_content
 
     def test_no_regulatory_without_predictions(self):
@@ -290,6 +309,69 @@ class TestAutoModelIntegration:
 
 class TestRegulatoryCalculation:
     """Test regulatory calculation details."""
+
+    def test_linear_regression_uses_one_sided_adverse_limit(self):
+        days = np.linspace(0, 100, 20)
+        conversion = 0.01 + 0.0002 * days + 0.001 * np.sin(days)
+        dataset = KineticDataset(
+            time=days * 86400,
+            temperature=np.full_like(days, 298.15),
+            conversion=conversion,
+        )
+
+        result = _calculate_shelf_life_trend([dataset], 298.15)
+
+        assert result is not None
+        assert result['regression_method'] == 'linear regression'
+        assert result['shelf_life_lower_95_days'] < result['shelf_life_days']
+
+    def test_detects_and_selects_quadratic_trend(self):
+        days = np.linspace(0, 182, 30)
+        conversion = 0.005 + 0.00003 * days + 0.000001 * days**2 + 0.0001 * np.sin(days)
+        dataset = KineticDataset(
+            time=days * 86400,
+            temperature=np.full_like(days, 293.15),
+            conversion=conversion,
+        )
+
+        result = _calculate_shelf_life_trend([dataset], 293.15)
+
+        assert result is not None
+        assert result['trend_type'] == 'quadratic'
+
+    def test_ancova_pools_parallel_batch_slopes(self):
+        days = np.linspace(0, 100, 20)
+        datasets = [
+            KineticDataset(
+                time=days * 86400,
+                temperature=np.full_like(days, 298.15),
+                conversion=offset + 0.0002 * days + 0.0002 * np.sin(days + phase),
+            )
+            for offset, phase in ((0.01, 0.0), (0.02, 0.4))
+        ]
+
+        result = _calculate_shelf_life_trend(datasets, 298.15)
+
+        assert result is not None
+        assert result['regression_method'] == 'ANCOVA with common slope'
+        assert result['slope_p_value'] > result['poolability_alpha']
+
+    def test_ancova_keeps_nonparallel_batch_slopes_separate(self):
+        days = np.linspace(0, 100, 20)
+        datasets = [
+            KineticDataset(
+                time=days * 86400,
+                temperature=np.full_like(days, 298.15),
+                conversion=offset + slope * days + 0.0001 * np.sin(days + phase),
+            )
+            for offset, slope, phase in ((0.01, 0.0001, 0.0), (0.02, 0.0005, 0.4))
+        ]
+
+        result = _calculate_shelf_life_trend(datasets, 298.15)
+
+        assert result is not None
+        assert result['regression_method'] == 'separate batch linear regressions'
+        assert result['slope_p_value'] <= result['poolability_alpha']
 
     def test_study_duration_calculation(self):
         """Test study duration is correctly calculated from datasets."""

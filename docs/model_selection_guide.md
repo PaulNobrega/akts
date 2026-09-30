@@ -99,9 +99,8 @@ without assuming a specific reaction model.
 
 - **Use it when:** the reaction mechanism is unknown, may change during the
     reaction, or you want to examine how activation energy varies with conversion.
-- **Data needed:** measurements at multiple temperatures that cover overlapping
-    conversion ranges. Automated analysis adds Friedman when it detects at least
-    three distinct dataset mean temperatures (rounded to the nearest kelvin).
+- **Data needed:** measurements at three or more distinct mean temperatures
+    (rounded to the nearest kelvin) that cover overlapping conversion ranges.
 - **Interpretation:** changing `Ea(α)` can indicate a changing or multi-step
     process; it does not identify a unique reaction mechanism.
 - **Limitations:** the method estimates rates from measured conversion curves,
@@ -109,8 +108,7 @@ without assuming a specific reaction model.
     may be omitted or fail when there is insufficient usable data.
 
 Use the [model selector](model_selector.md) to request Friedman explicitly with
-`models.modelfree.Friedman`. It is added automatically when the temperature
-criterion is met, including when `models_to_try` is supplied.
+`models.modelfree.Friedman`. Automated analysis never adds it unless selected.
 
 ### Choosing Between ODE and Model-Free Methods
 

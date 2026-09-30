@@ -14,21 +14,8 @@ import matplotlib.pyplot as plt
 from .datatypes import KineticDataset, FitResult, BootstrapResult, PredictionResult
 from .json_utils import convert_numpy_to_python
 from .regulatory_plots import create_regulatory_shelf_life_plot, create_regulatory_comparison_plot
-
-
-_SECONDS_PER_TIME_UNIT = {
-    'second': 1, 'seconds': 1, 's': 1,
-    'minute': 60, 'minutes': 60, 'min': 60,
-    'hour': 3600, 'hours': 3600, 'h': 3600, 'hr': 3600,
-    'day': 86400, 'days': 86400, 'd': 86400,
-    'week': 604800, 'weeks': 604800,
-    'month': 2592000, 'months': 2592000,
-    'year': 31536000, 'years': 31536000, 'yr': 31536000,
-}
-
-
-def _seconds_per_time_unit(unit: str) -> float:
-    return _SECONDS_PER_TIME_UNIT.get(unit.lower().strip(), 1)
+from .utils import seconds_per_time_unit as _seconds_per_time_unit, SECONDS_PER_MONTH
+from .models import model_display_name
 
 
 def _embed_base64_image(fig) -> str:
@@ -83,15 +70,6 @@ def _create_comparison_table_html(ranked_models: List[Dict]) -> str:
             return fallback
         return format(number, spec) if np.isfinite(number) else fallback
 
-    # Model display names for prettier output
-    MODEL_NAMES = {
-        'F1': 'F1 (first-order)', 'F2': 'F2 (second-order)', 'F3': 'F3 (third-order)',
-        'A2': 'A2 (Avrami-Erofeev, n=2)', 'A3': 'A3 (Avrami-Erofeev, n=3)',
-        'R2': 'R2 (contracting area)', 'R3': 'R3 (contracting volume)',
-        'D2': 'D2 (2D diffusion)', 'D3': 'D3 (3D diffusion, Jander)',
-        'D4': 'D4 (3D diffusion, G-B)', 'D1': 'D1 (1D diffusion)'
-    }
-
     finite_aics = []
     for model in ranked_models:
         try:
@@ -105,9 +83,7 @@ def _create_comparison_table_html(ranked_models: List[Dict]) -> str:
     for model in ranked_models:
         rank = model.get('rank', '?')
         name = model.get('model_name', 'Unknown')
-        # Convert "F1_model" to "F1 (first-order)"
-        base_name = name.replace('_model', '')
-        display_name = MODEL_NAMES.get(base_name, name)
+        display_name = model_display_name(name)  # "F1_model" -> "F1 (first-order)"
 
         stats = model.get('stats', model.get('statistics', {}))  # Support both 'stats' and 'statistics'
         score = model.get('score')
@@ -149,6 +125,22 @@ def _create_comparison_table_html(ranked_models: List[Dict]) -> str:
     return html
 
 
+def _fit_ci_for_dataset(fit_result: FitResult, i: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Bootstrap (lower, upper) conversion band for dataset i, if one was computed."""
+    bands = getattr(fit_result, 'conversion_simulated_ci', None)
+    if not bands or i >= len(bands) or bands[i] is None:
+        return None
+    lower, upper = bands[i]
+    if lower is None or upper is None:
+        return None
+    return np.asarray(lower, dtype=float), np.asarray(upper, dtype=float)
+
+
+def _rgba(color: str, alpha: float) -> str:
+    """'rgb(r, g, b)' -> 'rgba(r, g, b, alpha)' for Plotly fill colors."""
+    return color.replace('rgb(', 'rgba(').replace(')', f', {alpha})')
+
+
 def _create_fit_plot_matplotlib(
     datasets: List[KineticDataset],
     fit_result: FitResult,
@@ -179,8 +171,10 @@ def _create_fit_plot_matplotlib(
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), height_ratios=[3, 1])
 
-    # Plot experimental data and fits
-    colors = plt.cm.viridis(np.linspace(0, 0.9, len(datasets)))
+    # Keep the static palette and dataset selection in step with Plotly.
+    viridis_colors = ['#440154', '#3b528b', '#21918c', '#5ec962', '#fde725']
+    colors = [viridis_colors[int(i * (len(viridis_colors) - 1) / max(len(datasets) - 1, 1))]
+              for i in range(len(datasets))]
 
     for i, dataset in enumerate(datasets):
         temp_K = dataset.temperature.mean()
@@ -195,6 +189,10 @@ def _create_fit_plot_matplotlib(
         if hasattr(fit_result, 'conversion_simulated') and fit_result.conversion_simulated is not None:
             if isinstance(fit_result.conversion_simulated, list):
                 if i < len(fit_result.conversion_simulated):
+                    band = _fit_ci_for_dataset(fit_result, i)
+                    if band is not None:
+                        ax1.fill_between(dataset.time, band[0], band[1], color=colors[i], alpha=0.2,
+                                         linewidth=0, label=f'95% CI @ {temp_C:.0f}°C')
                     ax1.plot(dataset.time, fit_result.conversion_simulated[i],
                             label=f'Fit @ {temp_C:.0f}°C',
                             color=colors[i], linewidth=2)
@@ -212,7 +210,7 @@ def _create_fit_plot_matplotlib(
     ax1.set_xlabel('Time', fontsize=12)
     ax1.set_ylabel('Conversion', fontsize=12)
     ax1.set_title(title, fontsize=14, fontweight='bold')
-    ax1.legend(loc='best', fontsize=10)
+    ax1.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize=10)
     ax1.grid(True, alpha=0.3)
     ax1.set_ylim(-0.05, 1.05)
 
@@ -222,7 +220,7 @@ def _create_fit_plot_matplotlib(
     ax2.set_ylabel('Residuals', fontsize=12)
     ax2.grid(True, alpha=0.3)
 
-    plt.tight_layout()
+    plt.tight_layout(rect=(0, 0, 0.78, 1))
     image_str = _embed_base64_image(fig)
     plt.close(fig)
 
@@ -294,6 +292,21 @@ def _create_fit_plot_interactive(
         if hasattr(fit_result, 'conversion_simulated') and fit_result.conversion_simulated is not None:
             if isinstance(fit_result.conversion_simulated, list):
                 if i < len(fit_result.conversion_simulated):
+                    band = _fit_ci_for_dataset(fit_result, i)
+                    if band is not None:
+                        t_list = dataset.time.tolist()
+                        fig.add_trace(
+                            go.Scatter(
+                                x=t_list + t_list[::-1],
+                                y=band[1].tolist() + band[0].tolist()[::-1],
+                                fill='toself',
+                                fillcolor=_rgba(colors[i], 0.2),
+                                line=dict(color='rgba(255,255,255,0)'),
+                                name=f'95% CI @ {temp_C:.0f}°C',
+                                hoverinfo='skip',
+                            ),
+                            row=1, col=1
+                        )
                     fig.add_trace(
                         go.Scatter(
                             x=dataset.time.tolist(),
@@ -394,7 +407,10 @@ def _create_prediction_plot_interactive(
     # Confidence interval
     if lower is not None and upper is not None:
         fig.add_trace(go.Scatter(
-            x=time + time[::-1],
+            # Closed polygon: forward along the upper bound, back along the lower.
+            # Build as lists -- `time` may be an ndarray, where `+` would add
+            # element-wise instead of concatenating.
+            x=list(time) + list(time)[::-1],
             y=list(upper) + list(lower)[::-1],
             fill='toself',
             fillcolor='rgba(0, 100, 200, 0.2)',
@@ -452,8 +468,8 @@ def _create_prediction_plot_matplotlib(
     lower = predictions.get('conversion_lower')
     upper = predictions.get('conversion_upper')
     if lower is not None and upper is not None:
-        ax.fill_between(time, lower, upper, color='#1f77b4', alpha=0.2, label='Confidence interval')
-    ax.plot(time, conversion, color='#1f77b4', linewidth=2, label='Predicted conversion')
+        ax.fill_between(time, lower, upper, color='#0064c8', alpha=0.2, label='95% CI')
+    ax.plot(time, conversion, color='#0064c8', linewidth=3, label='Predicted Conversion')
     temp_K = predictions.get('temperature_K')
     if temp_K is not None:
         title = f"{title} (at {temp_K - 273.15:.1f}°C / {temp_K:.1f} K)"
@@ -586,7 +602,10 @@ def _create_simulation_plot_interactive(
     # Confidence interval for conversion
     if lower is not None and upper is not None:
         fig.add_trace(go.Scatter(
-            x=time + time[::-1],
+            # Closed polygon: forward along the upper bound, back along the lower.
+            # Build as lists -- `time` may be an ndarray, where `+` would add
+            # element-wise instead of concatenating.
+            x=list(time) + list(time)[::-1],
             y=list(upper) + list(lower)[::-1],
             fill='toself',
             fillcolor='rgba(31, 119, 180, 0.4)',  # High opacity for visibility
@@ -635,41 +654,56 @@ def _create_simulation_plot_matplotlib(
     simulation: Dict,
     title: str = "Temperature Excursion Simulation"
 ) -> str:
-    """Create a static conversion and temperature plot without Plotly."""
+    """Create a static conversion plot with temperature-excursion markers."""
     time_seconds = np.asarray(simulation.get('time', []), dtype=float)
     conversion = np.asarray(simulation.get('conversion_mean', []), dtype=float)
-    temperature = np.asarray(simulation.get('temperature', []), dtype=float)
     if time_seconds.size == 0 or conversion.size == 0:
         return "<p>Simulation plot unavailable: no simulation data.</p>"
 
-    time_unit = simulation.get('time_unit', 'seconds')
+    time_unit = simulation.get('time_unit', 'days')
     time = time_seconds / _seconds_per_time_unit(time_unit)
 
     fig, conversion_ax = plt.subplots(figsize=(10, 5))
-    conversion_ax.plot(time, conversion, color='#1f77b4', linewidth=2, label='Conversion')
     lower = simulation.get('conversion_lower')
     upper = simulation.get('conversion_upper')
     if lower is not None and upper is not None:
-        conversion_ax.fill_between(time, lower, upper, color='#1f77b4', alpha=0.2, label='Confidence interval')
+        conversion_ax.fill_between(time, lower, upper, color='#1f77b4', alpha=0.4, label='95% CI')
+    conversion_ax.plot(time, conversion, color='#1f77b4', linewidth=3, label='Conversion (mean)')
     conversion_ax.set_xlabel(f"Time ({time_unit})")
     conversion_ax.set_ylabel('Conversion')
-    conversion_ax.set_ylim(-0.05, 1.05)
+    conversion_ax.set_ylim(-0.05, 1.1)
     conversion_ax.set_title(title)
     conversion_ax.grid(True, alpha=0.3)
 
-    temperature_ax = conversion_ax.twinx()
-    if temperature.size == time.size:
-        temperature_ax.plot(time, temperature, color='#d97706', linestyle='--', label='Temperature')
-    temperature_ax.set_ylabel(f"Temperature ({simulation.get('temperature_units', 'K')})")
-
     input_profile = simulation.get('input_profile', [])
-    if input_profile:
-        profile_times, profile_temps = zip(*input_profile)
-        temperature_ax.scatter(profile_times, profile_temps, color='#d97706', marker='o', zorder=3, label='Profile points')
+    temp_units = simulation.get('temperature_units', 'C')
+    if len(input_profile) > 1:
+        conversion_ax.vlines(
+            [profile_time for profile_time, _ in input_profile], 0, 1.05,
+            color='0.6', linestyle=':', linewidth=2, alpha=0.6, zorder=0
+        )
+        for index, (profile_time, temp_value) in enumerate(input_profile):
+            next_time = input_profile[index + 1][0] if index + 1 < len(input_profile) else time[-1]
+            midpoint = (profile_time + next_time) / 2
+            if temp_units.upper() == 'K':
+                temp_text = f"{temp_value:.0f}K ({temp_value - 273.15:.0f}°C)"
+            elif temp_units.upper() == 'C':
+                temp_text = f"{temp_value:.0f}°C"
+            elif temp_units.upper() == 'F':
+                temp_text = f"{temp_value:.0f}°F"
+            else:
+                temp_text = f"{temp_value:.1f}°{temp_units}"
+            conversion_ax.annotate(
+                temp_text, xy=(midpoint, 1.02), xycoords='data',
+                ha='center', va='bottom', fontsize=9, color='0.4',
+                bbox={'facecolor': 'white', 'edgecolor': '0.6', 'alpha': 0.9, 'pad': 3}
+            )
 
-    handles_1, labels_1 = conversion_ax.get_legend_handles_labels()
-    handles_2, labels_2 = temperature_ax.get_legend_handles_labels()
-    conversion_ax.legend(handles_1 + handles_2, labels_1 + labels_2, loc='best')
+    conversion_ax.legend(loc='upper left')
+    conversion_ax.text(
+        0.5, -0.18, 'Temperature indicated by annotations between vertical markers',
+        transform=conversion_ax.transAxes, ha='center', va='top', fontsize=9, color='gray'
+    )
     fig.tight_layout()
     image = _embed_base64_image(fig)
     plt.close(fig)
@@ -975,7 +1009,8 @@ def _generate_html_template(
 
 
 def _create_methods_section_html(selected_model: Dict, datasets: List[KineticDataset],
-                                 bootstrap_iterations: int = 0, confidence_level: float = 0.95) -> str:
+                                 bootstrap_iterations: int = 0, confidence_level: float = 0.95,
+                                 bootstrap_method: str = 'monte_carlo') -> str:
     """
     Generate Methods section for publication-ready documentation.
 
@@ -1081,16 +1116,34 @@ def _create_methods_section_html(selected_model: Dict, datasets: List[KineticDat
         '''
 
     if base_model_name == 'Friedman':
-        kinetic_model_html = f'''
+        kinetic_model_html = '''
         <p>
-            Friedman isoconversional analysis estimates activation energy at
-            conversion levels without assuming a specific reaction model.
+            At fixed conversion α, the differential rate has the Arrhenius form:
+        </p>
+        <div style="background-color: #f8f9fa; padding: 15px; border-left: 4px solid #667eea; margin: 15px 0; font-family: monospace;">
+            (dα/dt)<sub>α,T</sub> = A f(α) · exp[−Ea(α)/(R T)]
+        </div>
+        <p>
+            Friedman estimates Ea(α) separately at each conversion and does not
+            specify f(α), so it does not impose a particular reaction mechanism.
         </p>
         '''
         fitting_method_html = '''
         <p>
-            Activation energy was estimated at conversion levels using linear
-            regression of log reaction rate against inverse absolute temperature.
+            For each selected conversion α, the rate measured at each temperature
+            is regressed against inverse absolute temperature using the linearized equation:
+        </p>
+        <div style="background-color: #f8f9fa; padding: 15px; border-left: 4px solid #667eea; margin: 15px 0; font-family: monospace;">
+            ln[(dα/dt)<sub>α</sub>] = ln[A f(α)] − Ea(α)/(R T)
+        </div>
+        <div style="background-color: #f8f9fa; padding: 15px; border-left: 4px solid #667eea; margin: 15px 0; font-family: monospace;">
+            m<sub>α</sub> = d ln[(dα/dt)<sub>α</sub>] / d(1/T) = −Ea(α)/R;
+            Ea(α) = −R m<sub>α</sub>
+        </div>
+        <p>
+            R is the gas constant (8.314 J/(mol·K)) and T is absolute temperature (K).
+            The intercept ln[A f(α)] is not a standalone pre-exponential factor because
+            f(α) is unspecified.
         </p>
         '''
     elif base_model_name == 'A->B->C':
@@ -1180,22 +1233,45 @@ def _create_methods_section_html(selected_model: Dict, datasets: List[KineticDat
     '''
 
     if bootstrap_iterations > 0:
+        base_model_name = model_name.replace('_model', '')
+        if bootstrap_method == 'monte_carlo':
+            method_label = 'Monte Carlo case bootstrap'
+            sampling_description = '''
+                Complete observed rows (time, temperature, and conversion) were sampled with replacement within each dataset, retaining its original row count.
+                This can omit some observed time points and repeat others.
+            '''
+        elif bootstrap_method == 'parametric':
+            method_label = 'parametric Gaussian bootstrap'
+            sampling_description = '''
+                Independent Gaussian conversion errors were simulated around the fitted curves using residual standard deviations estimated per dataset
+                (with a pooled estimate when a dataset had too few finite residuals).
+            '''
+        else:
+            method_label = 'weighted residual bootstrap'
+            sampling_description = '''
+                Centered conversion residuals were pooled across datasets and resampled with replacement using conversion-transition weights,
+                then added to fitted curves; synthetic conversions were constrained to [0, 1].
+            '''
+
+        if base_model_name == 'Friedman':
+            refit_description = 'The Friedman isoconversional regressions were rerun for each synthetic dataset.'
+        else:
+            refit_description = 'The selected model was re-fitted to each synthetic dataset.'
+
         html += f'''
         <h3>Uncertainty Quantification</h3>
         <p>
-            Parameter uncertainties and prediction confidence intervals were estimated using
-            <strong>parametric bootstrap resampling</strong> with {bootstrap_iterations} iterations.
-            For each bootstrap replicate:
+            Uncertainty was estimated for the selected model using <strong>{method_label}</strong>
+            with {bootstrap_iterations} successful replicates:
         </p>
         <ol>
-            <li>Residuals from the best-fit model were calculated</li>
-            <li>Synthetic datasets were generated by resampling residuals with replacement</li>
-            <li>The model was re-fitted to the synthetic data</li>
-            <li>Parameter estimates and predictions were recorded</li>
+            <li>{sampling_description}</li>
+            <li>{refit_description}</li>
         </ol>
         <p>
-            The {confidence_level*100:.0f}% confidence intervals were computed from the distribution
-            of bootstrap parameter estimates using the percentile method.
+            The {confidence_level*100:.0f}% parameter confidence intervals use percentile bounds from
+            successful bootstrap estimates. Pointwise conversion bands use percentiles of bootstrap
+            prediction curves when those predictions are requested and computable.
         </p>
         '''
 
@@ -1208,11 +1284,6 @@ def _create_methods_section_html(selected_model: Dict, datasets: List[KineticDat
             with LSODA fallback for stiff systems).
         </p>
 
-        <h3>Data Availability</h3>
-        <p>
-            The kinetic parameters and fitted model are provided in the Statistical Details section.
-            Raw experimental data and complete analysis scripts are available upon request.
-        </p>
     </div>
     '''
 
@@ -1221,7 +1292,7 @@ def _create_methods_section_html(selected_model: Dict, datasets: List[KineticDat
 
 def _create_regulatory_section_html(regulatory: Dict) -> str:
     """
-    Generate ICH Q1E regulatory compliance section HTML.
+    Generate a regression-based shelf-life and extrapolation summary.
 
     Parameters
     ----------
@@ -1244,22 +1315,29 @@ def _create_regulatory_section_html(regulatory: Dict) -> str:
     # Calculate display values
     temp_c = regulatory['storage_temp_K'] - 273.15
     target_pct = regulatory['target_conversion'] * 100
+    shelf_life_confidence = regulatory.get('shelf_life_confidence_level', 0.95)
+    shelf_life_lower = regulatory.get('shelf_life_lower_confidence', regulatory['shelf_life_lower_95'])
+    trend_type = regulatory.get('trend_type', 'linear')
     warning_class = 'warning' if regulatory['exceeds_guideline'] else 'compliant'
+    if regulatory.get('shelf_life_is_long_term', True):
+        ceiling_formula = 'min(2 × study duration, study duration + 12 months)'
+    else:
+        ceiling_formula = '1.5 × study duration'
 
     if regulatory['exceeds_guideline']:
-        guideline_note = '⚠️ Estimate exceeds ICH Q1E ceiling - additional stability data needed for regulatory submission'
+        guideline_note = 'Estimate exceeds the configured extrapolation ceiling; further review is needed.'
     else:
-        guideline_note = '✓ Within ICH Q1E guidelines - suitable for regulatory shelf-life claim'
+        guideline_note = 'Estimate is within the configured extrapolation ceiling; this alone does not establish compliance.'
 
     # Generate regulatory plot if prediction data available
     regulatory_plot_html = ''
     if 'prediction' in regulatory and regulatory['prediction'] is not None:
         try:
             # Convert months back to seconds for plotting
-            shelf_life_mean_sec = regulatory['shelf_life_months'] * 30.44 * 24 * 3600
-            shelf_life_lower_sec = regulatory.get('shelf_life_lower_95', 0) * 30.44 * 24 * 3600 if regulatory.get('shelf_life_lower_95') else None
-            study_duration_sec = regulatory['study_duration_months'] * 30.44 * 24 * 3600
-            ich_ceiling_sec = regulatory['ich_ceiling_months'] * 30.44 * 24 * 3600
+            shelf_life_mean_sec = regulatory['shelf_life_months'] * SECONDS_PER_MONTH
+            shelf_life_lower_sec = regulatory.get('shelf_life_lower_95', 0) * SECONDS_PER_MONTH if regulatory.get('shelf_life_lower_95') else None
+            study_duration_sec = regulatory['study_duration_months'] * SECONDS_PER_MONTH
+            ich_ceiling_sec = regulatory['ich_ceiling_months'] * SECONDS_PER_MONTH
 
             fig = create_regulatory_shelf_life_plot(
                 prediction=regulatory['prediction'],
@@ -1268,7 +1346,8 @@ def _create_regulatory_section_html(regulatory: Dict) -> str:
                 shelf_life_lower_sec=shelf_life_lower_sec,
                 study_duration_sec=study_duration_sec,
                 ich_ceiling_sec=ich_ceiling_sec,
-                storage_temp_K=regulatory['storage_temp_K']
+                storage_temp_K=regulatory['storage_temp_K'],
+                confidence_band_level=regulatory.get('prediction_band_level', 0.95),
             )
 
             plot_base64 = _embed_base64_image(fig)
@@ -1278,8 +1357,8 @@ def _create_regulatory_section_html(regulatory: Dict) -> str:
             <div style="margin-top: 30px;">
                 <h3>Shelf-Life Visualization</h3>
                 <p style="font-size: 0.9em; color: #666;">
-                    This plot shows the model prediction, confidence intervals, and regulatory thresholds.
-                    The conservative shelf-life (one-sided 95% lower bound) is the recommended value for regulatory claims.
+                    This plot shows the selected same-temperature {trend_type} trend, confidence band, and regulatory thresholds.
+                    The shelf-life bound uses the one-sided {shelf_life_confidence:.0%} confidence limit in the adverse direction; no bootstrap is used for this regression calculation.
                 </p>
                 <img src="{plot_base64}" alt="Regulatory Shelf-Life Plot" style="max-width: 100%; height: auto;">
             </div>
@@ -1293,8 +1372,8 @@ def _create_regulatory_section_html(regulatory: Dict) -> str:
     html = f'''
     <div class="section">
         <h2>
-            ICH Q1E Regulatory Analysis
-            <button class="info-btn" onclick="showICHInfo()">ℹ️ ICH Q1E Guidelines</button>
+            Shelf-Life Regression Analysis
+            <button class="info-btn" onclick="showICHInfo()">ℹ️ Method Details</button>
         </h2>
 
         <div class="regulatory-summary">
@@ -1302,12 +1381,14 @@ def _create_regulatory_section_html(regulatory: Dict) -> str:
                 <h3>Shelf-Life Estimate</h3>
                 <p class="shelf-life-value">{regulatory['shelf_life_months']:.1f} months</p>
                 <p class="shelf-life-detail">
-                    <strong>95% Lower Bound (ICH Q1E):</strong> {regulatory['shelf_life_lower_95']:.1f} months<br>
+                    <strong>{shelf_life_confidence:.0%} Lower Shelf-Life Bound:</strong> {shelf_life_lower:.1f} months<br>
                     At {target_pct:.0f}% degradation threshold<br>
-                    Storage temperature: {temp_c:.0f}°C
+                    Storage temperature: {temp_c:.0f}°C<br>
+                    Trend: {trend_type}<br>
+                    Method: {regulatory.get('regression_method', 'linear regression')}
                 </p>
                 <p style="font-size: 0.85em; color: #666; margin-top: 10px;">
-                    <em>Note: ICH Q1E requires one-sided 95% lower confidence bound for conservative shelf-life claims.</em>
+                    <em>{trend_type.title()} regression/ANCOVA at the storage condition; bootstrap resampling is not used for this estimate.</em>
                 </p>
             </div>
 
@@ -1316,16 +1397,18 @@ def _create_regulatory_section_html(regulatory: Dict) -> str:
                 <p><strong>Study Duration:</strong> {regulatory['study_duration_months']:.0f} months</p>
                 <p><strong>Maximum Allowed Extrapolation:</strong> {regulatory['ich_ceiling_months']:.0f} months</p>
                 <p style="font-size: 0.85em; color: #666; margin: 5px 0;">
-                    Formula: min(2 × study duration, study duration + 12 months)
+                    Formula: {ceiling_formula}
                 </p>
                 <p class="guideline-note" style="margin-top: 15px;">{guideline_note}</p>
             </div>
         </div>
 
         <p style="font-size: 0.9em; color: #666; margin-top: 20px;">
-            <strong>Interpretation:</strong> The one-sided 95% lower bound provides a conservative shelf-life estimate
-            suitable for regulatory submissions. If the estimate exceeds the ICH Q1E ceiling, additional long-term
-            stability data should be collected to support the shelf-life claim.
+            <strong>Interpretation:</strong> Shelf life is the time when the one-sided {shelf_life_confidence:.0%} confidence limit for the mean
+            in the adverse direction reaches the specification. The selected limit is upper for increasing degradation
+            conversion and lower for decreasing attributes. If the estimate exceeds the ICH Q1E ceiling, additional
+            long-term stability data should be collected to support the shelf-life claim. This automated estimate
+            does not by itself establish regulatory compliance.
         </p>
 
         {regulatory_plot_html}
@@ -1334,12 +1417,12 @@ def _create_regulatory_section_html(regulatory: Dict) -> str:
     <div id="ich-info-modal" class="modal">
         <div class="modal-content">
             <span class="close" onclick="closeICHInfo()">&times;</span>
-            <h3>ICH Q1E Stability Testing Guidelines</h3>
+            <h3>Shelf-Life Regression Method</h3>
 
             <h4>Shelf-Life Determination</h4>
             <ul>
-                <li>Use <strong>one-sided 95% confidence interval</strong> (lower bound) for shelf-life estimates</li>
-                <li>Shelf-life is when the 95% lower bound crosses the specification limit (e.g., 5% degradation)</li>
+                <li>Use the <strong>one-sided {shelf_life_confidence:.0%} confidence limit in the adverse direction</strong> for shelf-life estimates</li>
+                <li>Shelf-life is when that limit crosses the specification (e.g., an upper limit for increasing degradation)</li>
                 <li>This approach is more conservative than using the mean prediction</li>
                 <li>Provides adequate assurance that the product will remain within specifications</li>
             </ul>
@@ -1353,12 +1436,11 @@ def _create_regulatory_section_html(regulatory: Dict) -> str:
                 <li><strong>Accelerated data:</strong> Up to 1.5 × study duration (not shown here)</li>
             </ul>
 
-            <h4>Regulatory Context</h4>
+            <h4>Scope</h4>
             <p>
-                The ICH Q1E guideline provides a framework for evaluating and extrapolating stability data
-                for drug substances and products. The extrapolation limits ensure that shelf-life claims
-                are supported by adequate stability data and modeling, reducing the risk of product failure
-                in the field.
+                This automated regression and extrapolation summary is not a determination of ICH Q1E
+                compliance. Confirm the selected trend, specification, study design, and applicable
+                regulatory requirements before using a shelf-life estimate in a submission.
             </p>
 
             <p style="margin-top: 15px;">
@@ -1423,7 +1505,7 @@ def generate_isothermal_report(
     summary : Dict, optional
         Summary statistics
     regulatory : Dict, optional
-        ICH Q1E regulatory compliance analysis containing shelf-life estimates
+        Regression-based shelf-life estimates, selected trend, confidence level,
         and extrapolation ceiling information
 
     Returns
@@ -1451,15 +1533,7 @@ def generate_isothermal_report(
         top_fit = fit_results[0]
         # Use the display name from top_models
         model_display = top_models[0].get('model_name', 'Top Model')
-        # Convert to friendly name
-        base_name = model_display.replace('_model', '')
-        MODEL_NAMES = {
-            'F1': 'F1 (first-order)', 'F2': 'F2 (second-order)', 'F3': 'F3 (third-order)',
-            'A2': 'A2 (Avrami-Erofeev, n=2)', 'A3': 'A3 (Avrami-Erofeev, n=3)',
-            'R2': 'R2 (contracting area)', 'R3': 'R3 (contracting volume)',
-            'D2': 'D2 (2D diffusion)', 'D3': 'D3 (3D diffusion, Jander)',
-        }
-        friendly_name = MODEL_NAMES.get(base_name, model_display)
+        friendly_name = model_display_name(model_display)
 
         fit_plots_html += f"<h3>{friendly_name}</h3>"
 
@@ -1499,11 +1573,13 @@ def generate_isothermal_report(
         bootstrap_iters = 0
         if summary and 'bootstrap_iterations' in summary:
             bootstrap_iters = summary['bootstrap_iterations']
+        bootstrap_confidence_level = (summary or {}).get('confidence_level', 0.95)
         methods_html = _create_methods_section_html(
             selected_model=selected_model,
             datasets=datasets,
             bootstrap_iterations=bootstrap_iters,
-            confidence_level=0.95
+            confidence_level=bootstrap_confidence_level,
+            bootstrap_method=(summary or {}).get('bootstrap_method', 'monte_carlo'),
         )
 
     # Generate details HTML
@@ -1585,12 +1661,26 @@ def generate_isothermal_report(
 
         details_html += '</tbody></table>'
 
-        # Add bootstrap information if available
-        if summary and summary.get('bootstrap_iterations', 0) > 0:
+        # Include requested settings even when every requested replicate failed.
+        bootstrap_requested = (summary or {}).get(
+            'bootstrap_iterations_requested', (summary or {}).get('bootstrap_iterations', 0)
+        )
+        bootstrap_completed = (summary or {}).get('bootstrap_iterations', 0)
+        if summary and bootstrap_requested > 0:
+            method_names = {
+                'monte_carlo': 'Monte Carlo case resampling',
+                'parametric': 'Parametric Gaussian resampling',
+                'residual': 'Weighted residual resampling',
+            }
+            method = summary.get('bootstrap_method')
+            method_label = method_names.get(method, method or 'Not recorded')
+            confidence_level = summary.get('confidence_level', 0.95)
             details_html += "<h3>Bootstrap Analysis</h3>"
             details_html += '<table class="param-table"><thead><tr><th>Item</th><th>Value</th></tr></thead><tbody>'
-            details_html += f'<tr><td>Bootstrap Iterations</td><td>{summary["bootstrap_iterations"]}</td></tr>'
-            details_html += f'<tr><td>Confidence Level</td><td>95%</td></tr>'
+            details_html += f'<tr><td>Bootstrap Method</td><td>{method_label}</td></tr>'
+            details_html += f'<tr><td>Iterations Requested</td><td>{bootstrap_requested}</td></tr>'
+            details_html += f'<tr><td>Successful Iterations</td><td>{bootstrap_completed}</td></tr>'
+            details_html += f'<tr><td>Confidence Level</td><td>{confidence_level:.0%}</td></tr>'
 
             # Note about degenerate sample filtering (our new feature!)
             details_html += '<tr><td>Quality Control</td><td>Bootstrap replicates with unrealistic predictions (&lt;1% final conversion) automatically excluded from CI calculation</td></tr>'

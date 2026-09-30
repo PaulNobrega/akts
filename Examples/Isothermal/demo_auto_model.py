@@ -126,16 +126,19 @@ if results['predictions']:
         # Simulates: 5 days at 25°C, 2 days shipping at 40°C, then back to 25°C for 23 days
         # Values in kelvin to match input file
         shipping_profile = [
-            (0, 25+273.15),      # Day 0: Start at 25°C
-            (5, 25+273.15),      # Day 5: Still at 25°C (before shipping)
-            (7, 40+273.15),      # Day 7: Heated to 40°C during 2-day shipping
-            (10, 25+273.15),     # Day 10: Back to 25°C (after shipping)
-            (30, 25+273.15),     # Day 30: End at 25°C
+            (0, 30+273.15),      # Day 0: Start at 30°C
+            (5, 30+273.15),      # Day 5: Still at 30°C (before shipping)
+            (7, 80+273.15),      # Day 7: Heated to 80°C during 2-day shipping
+            (10, 40+273.15),     # Day 10: Back to 40°C (after shipping)
+            (30, 40+273.15),     # Day 30: End at 40°C
         ]
 
         results = auto_model_isothermal_data(
             data_files=existing_files,
-            predict=(3, 'year', 313.15),   # Predict at 313.15 K (40°C) for 3 years (always in kelvin)
+            predict=(3, 'year', 40+273.15),   # Predict at 313.15 K (40°C) for 3 years (always in kelvin)
+            shelf_life_temperature_C=40.0,    # Lowest observed storage condition in this study
+            shelf_life_target_conversion=0.05, #5% conversion (degradation)
+            shelf_life_confidence_level=0.95,  # CI
             simulate=shipping_profile,     # Simulate shipping temperature excursion
             simulate_time_unit='days',     # Time unit for shipping profile. units: 'seconds', 'minutes', 'hours', 'days', 'weeks', 'months', 'years'
             input_temperature_units='K',   # Input temps in Kelvin. Can be F, C, or K
@@ -144,6 +147,7 @@ if results['predictions']:
             convergence_threshold=0.15,  # 15% convergence threshold
             models_to_try=models.all,  # Use model selector! Try: models.kinetic.all, models.empirical.all, models.all
             bootstrap_iterations=100,  # 100 bootstrap samples for confidence intervals
+            bootstrap_method='monte_carlo', # Method for bootstrap confidence intervals. Options: 'monte_carlo' (default), 'parametric', 'residual'
             report_path=output_dir / 'isothermal_stability_report.html',
             report_format='interactive',  # Interactive plots with plotly, 'static' is for publication quality images, 'both' for both formats
             progress_callback=progress_callback, #defined above
@@ -295,8 +299,21 @@ if results['predictions']:
                 except Exception as e:
                     print(f"  [SKIP] Multi-temperature plot: {e}")
 
-                # 2. Arrhenius plot with data points and CI (if Ea and A parameters exist)
-                if 'Ea' in params and any(k.startswith('A') for k in params):
+                # 2. Arrhenius plot. Model-free (Friedman) results have no single
+                # Ea/A pair, so show the per-conversion Friedman regression instead.
+                if fit_result.model_name == 'Friedman':
+                    try:
+                        from akts import plot_friedman_arrhenius
+                        fig = plot_friedman_arrhenius(
+                            fit_result.model_definition_args['iso_result'], datasets
+                        )
+                        plot_path = output_dir / 'arrhenius_plot.png'
+                        fig.savefig(plot_path, dpi=300, bbox_inches='tight')
+                        print(f"  [OK] Saved: {plot_path.name}")
+                        plots_generated += 1
+                    except Exception as e:
+                        print(f"  [SKIP] Arrhenius plot: {e}")
+                elif 'Ea' in params and any(k.startswith('A') for k in params):
                     try:
                         bootstrap_res = results.get('bootstrap_results', {}).get(selected['model_name'])
                         fig = plot_arrhenius(
@@ -340,10 +357,10 @@ if results['predictions']:
 
         print("=" * 80)
         print(" Tips:")
-        print("   - HTML report includes ICH Q1E regulatory analysis")
+        print("   - Shelf-life regression is available when data match the configured storage temperature")
         print("   - Use output_format='json' for API integration")
         print("   - Plot PNG files are 300 DPI, ready for publication")
-        print("   - All results include 95% confidence intervals from bootstrap")
+        print("   - Bootstrap intervals are included when requested and successfully estimated")
         print("=" * 80)
 
     except Exception as e:

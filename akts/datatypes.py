@@ -63,6 +63,7 @@ class BootstrapResult:
     ranked_replicates: Optional[List[Dict]] = None  # Replicates ranked by RSS on resampled data
     median_parameters: Optional[Dict[str, float]] = None  # Median parameters (A-scale)
     median_stats: Optional[Dict] = None  # Statistics for median parameters on original data
+    bootstrap_method: str = 'monte_carlo'
 
     def to_dataframe(self):
         """

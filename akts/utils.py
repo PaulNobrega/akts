@@ -1,13 +1,55 @@
 # utils.py
 import numpy as np
 from scipy.signal import savgol_filter
-from scipy.interpolate import interp1d
-from scipy.stats import linregress
+from bisect import bisect_right
 import warnings
-from typing import Callable, Dict, List, Tuple, Union, Any  # Added List, Tuple, Union, Any
+from typing import Callable, Dict, List, Tuple, Any
 
 # Ideal gas constant (J/mol·K)
 R_GAS = 8.31446261815324
+
+# --- Canonical time-unit-to-seconds conversions ---
+# Single source of truth for "month"/"year" as seconds -- other modules
+# (helpers.py, reporting.py, plotting.py, regulatory_plots.py) previously each
+# hardcoded their own approximation (some used a 30-day month / 365-day year,
+# others 30.44 / 365.25), which drifted apart and gave slightly different
+# shelf-life numbers depending on which module computed them.
+#
+# SECONDS_PER_YEAR uses the average Gregorian calendar year (365.2425 days --
+# accounts for the actual leap-year rule: +1 day every 4 years, -1 every 100,
+# +1 every 400), which is more accurate than the common Julian-year
+# approximation (365.25 days) for any conversion meant to track calendar time.
+# SECONDS_PER_MONTH is exactly SECONDS_PER_YEAR / 12, so "12 months" and
+# "1 year" always agree exactly.
+SECONDS_PER_MINUTE = 60.0
+SECONDS_PER_HOUR = 3600.0
+SECONDS_PER_DAY = 86400.0
+SECONDS_PER_WEEK = 7.0 * SECONDS_PER_DAY
+SECONDS_PER_YEAR = 365.2425 * SECONDS_PER_DAY
+SECONDS_PER_MONTH = SECONDS_PER_YEAR / 12.0
+
+# Every accepted spelling of each unit, mapped to its value in seconds.
+TIME_UNITS_TO_SECONDS: Dict[str, float] = {
+    'second': 1.0, 'seconds': 1.0, 's': 1.0,
+    'minute': SECONDS_PER_MINUTE, 'minutes': SECONDS_PER_MINUTE, 'min': SECONDS_PER_MINUTE,
+    'hour': SECONDS_PER_HOUR, 'hours': SECONDS_PER_HOUR, 'h': SECONDS_PER_HOUR, 'hr': SECONDS_PER_HOUR,
+    'day': SECONDS_PER_DAY, 'days': SECONDS_PER_DAY, 'd': SECONDS_PER_DAY,
+    'week': SECONDS_PER_WEEK, 'weeks': SECONDS_PER_WEEK,
+    'month': SECONDS_PER_MONTH, 'months': SECONDS_PER_MONTH,
+    'year': SECONDS_PER_YEAR, 'years': SECONDS_PER_YEAR, 'yr': SECONDS_PER_YEAR,
+}
+
+
+def seconds_per_time_unit(unit: str) -> float:
+    """Looks up TIME_UNITS_TO_SECONDS case/whitespace-insensitively.
+
+    Returns 1.0 (i.e. treats the value as already in seconds) for an unknown
+    unit, matching the historical fallback behavior of reporting.py's plot
+    helpers -- callers that must reject unknown units (e.g. user-facing
+    "predict=(3, 'year')" parsing) should validate against
+    TIME_UNITS_TO_SECONDS directly instead of relying on this fallback.
+    """
+    return TIME_UNITS_TO_SECONDS.get(unit.lower().strip(), 1.0)
 
 def numerical_diff(x: np.ndarray, y: np.ndarray, *, window_length: int = 5, polyorder: int = 2) -> np.ndarray:
     """
@@ -135,19 +177,73 @@ def calculate_adjusted_r_squared(r_squared: float, n_params: int, n_datapoints: 
     return 1.0 - (1.0 - r_squared) * (n - 1) / (n - k - 1)
 
 def get_temperature_interpolator(time: np.ndarray, temperature: np.ndarray) -> Callable:
-    """Creates an interpolation function for temperature T(t)."""
+    """Creates a fast piecewise-linear temperature function T(t) [K].
+
+    Matches scipy's ``interp1d(kind='linear', fill_value='extrapolate')`` -- linear
+    interpolation inside the data, linear extrapolation from the end segments
+    outside it -- but is called once per ODE right-hand-side evaluation, so it is
+    implemented without interp1d's per-call validation overhead (~100 us/call):
+
+    - exactly constant temperature (the usual isothermal stability study) returns
+      a constant function (~0.2 us/call);
+    - otherwise it uses ``np.interp`` plus explicit end-slope extrapolation
+      (~7 us/call).
+
+    Scalar input returns a Python float; array input returns an ndarray.
+    """
+    time = np.asarray(time, dtype=float)
+    temperature = np.asarray(temperature, dtype=float)
     if len(time) != len(temperature):
         raise ValueError("Time and temperature arrays must have the same length.")
     if len(time) < 2:
         if len(temperature) == 1:
-            const_temp = temperature[0]
+            const_temp = float(temperature[0])
             warnings.warn("Only one data point provided for temperature interpolation. Returning constant temperature function.")
-            return lambda t: np.full_like(np.asarray(t), const_temp)  # Return array for vectorization
-        else:
-            raise ValueError("Cannot create temperature interpolator with less than 2 points.")
-    # Use linear interpolation, handle edge cases by filling with endpoint values
-    # Allow extrapolation for times outside the original range
-    return interp1d(time, temperature, kind='linear', bounds_error=False, fill_value="extrapolate")
+            return _constant_temperature_function(const_temp)
+        raise ValueError("Cannot create temperature interpolator with less than 2 points.")
+
+    if np.all(temperature == temperature[0]):
+        return _constant_temperature_function(float(temperature[0]))
+
+    order = np.argsort(time, kind='stable')
+    t_sorted, T_sorted = time[order], temperature[order]
+    t_lo, t_hi = float(t_sorted[0]), float(t_sorted[-1])
+    T_lo, T_hi = float(T_sorted[0]), float(T_sorted[-1])
+    dt_lo = float(t_sorted[1] - t_sorted[0])
+    dt_hi = float(t_sorted[-1] - t_sorted[-2])
+    slope_lo = float(T_sorted[1] - T_sorted[0]) / dt_lo if dt_lo != 0 else 0.0
+    slope_hi = float(T_sorted[-1] - T_sorted[-2]) / dt_hi if dt_hi != 0 else 0.0
+
+    t_list, T_list = t_sorted.tolist(), T_sorted.tolist()
+
+    def temperature_at(t):
+        if isinstance(t, (float, int, np.floating, np.integer)):
+            # Scalar fast path (the ODE solver's call pattern): pure-Python
+            # bisection avoids numpy's per-call array overhead.
+            x = float(t)
+            if x <= t_lo:
+                return T_lo + slope_lo * (x - t_lo)
+            if x >= t_hi:
+                return T_hi + slope_hi * (x - t_hi)
+            i = bisect_right(t_list, x) - 1
+            t0, t1 = t_list[i], t_list[i + 1]
+            T0 = T_list[i]
+            return T0 + (T_list[i + 1] - T0) * (x - t0) / (t1 - t0) if t1 > t0 else T0
+        t_arr = np.asarray(t, dtype=float)
+        T = np.interp(t_arr, t_sorted, T_sorted)
+        T = np.where(t_arr < t_lo, T_lo + slope_lo * (t_arr - t_lo), T)
+        T = np.where(t_arr > t_hi, T_hi + slope_hi * (t_arr - t_hi), T)
+        return float(T) if T.ndim == 0 else T
+
+    return temperature_at
+
+
+def _constant_temperature_function(value: float) -> Callable:
+    def constant_temperature(t):
+        if isinstance(t, (float, int, np.floating, np.integer)) or np.ndim(t) == 0:
+            return value
+        return np.full(np.shape(t), value)
+    return constant_temperature
 
 # --- NEW Helper Function ---
 def construct_profile(segments: List[Dict[str, Any]], points_per_segment: int = 50) -> Tuple[np.ndarray, np.ndarray]:
@@ -247,6 +343,8 @@ def construct_profile(segments: List[Dict[str, Any]], points_per_segment: int = 
 
         else:
             raise ValueError(f"Unknown segment type '{seg_type}' in segment {i}.")
+
+    return np.asarray(combined_time, dtype=float), np.asarray(combined_temp, dtype=float)
 
 
 def is_isothermal(temperature: np.ndarray, tolerance_K: float = 0.5) -> bool:
@@ -485,15 +583,9 @@ def export_prediction_report(
         try:
             import matplotlib.pyplot as plt
 
-            # Time unit conversion
-            time_conversion = {
-                'seconds': 1.0,
-                'hours': 1 / 3600,
-                'days': 1 / (24 * 3600),
-                'months': 1 / (30.44 * 24 * 3600),
-                'years': 1 / (365.25 * 24 * 3600)
-            }
-            time_factor = time_conversion.get(time_units, 1.0)
+            # Time unit conversion (seconds -> time_units, i.e. the inverse of
+            # TIME_UNITS_TO_SECONDS)
+            time_factor = 1.0 / seconds_per_time_unit(time_units)
 
             fig, ax = plt.subplots(figsize=(10, 6))
 

@@ -127,7 +127,8 @@ def test_auto_model_with_synthetic_data():
             data_files=datasets,
             models_to_try=['F1', 'F2', 'A2'],  # Limited models for speed
             top_n=2,
-            bootstrap_iterations=20,  # Reduced for speed
+            bootstrap_iterations=2,  # Reduced for speed
+            bootstrap_method='parametric',
             report_path=None,  # Skip HTML for test
             output_format='dict',
             progress_callback=progress_cb
@@ -142,6 +143,9 @@ def test_auto_model_with_synthetic_data():
         assert 'top_models' in results
         assert 'selected_model' in results
         assert 'summary' in results
+        assert results['summary']['bootstrap_method'] == 'parametric'
+        assert results['summary']['bootstrap_iterations_requested'] == 2
+        assert results['summary']['confidence_level'] == 0.95
         assert len(results['top_models']) > 0
 
         # Check that F1 is top ranked (since we generated F1 data)

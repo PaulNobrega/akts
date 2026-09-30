@@ -10,6 +10,7 @@ For routine analyses, use [auto_model_isothermal_data()](automated_analysis.md).
 - Integration with existing pipelines
 - Batch processing automation
 - Fine control over every step
+- A different ODE solver or reproducible bootstraps ([Numerical Solvers](#numerical-solvers-and-performance))
 
 ## Manual Step-by-Step Workflow
 
@@ -267,6 +268,100 @@ results = auto_model_isothermal_data(
     progress_callback=my_callback
 )
 ```
+
+## Numerical Solvers and Performance
+
+Every model that is not solved in closed form is integrated with
+[`scipy.integrate.solve_ivp`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.integrate.solve_ivp.html).
+You can choose the integration method through the `solver_options` dictionary,
+which is accepted by `fit_kinetic_model()`, `run_bootstrap()`,
+`predict_conversion()`, `predict_conversion_model_free()` and `simulate_kinetics()`.
+
+### Closed-form fast path (no ODE solve)
+
+Single-step models with an analytic isothermal solution are evaluated exactly
+instead of being integrated:
+
+| Models | When it applies |
+|---|---|
+| F0, F1, F2, F3, A2, A3, R2, R3, D2, D3, D4 | Fitting and bootstrap: all datasets are isothermal (temperature std < 0.5 K). Prediction: constant temperature program and `initial_alpha=0`. |
+
+This is automatic and needs no configuration. It is the reason a typical
+isothermal stability fit takes a fraction of a second. Models without a closed
+form (Fn, SB, SB_mn, SB_mnp, Bna, D1, A->B->C, A+B->C), and any non-isothermal
+data, use the ODE path below.
+
+### Available solvers
+
+| Method | Type | Use when |
+|---|---|---|
+| `'LSODA'` (**default primary**) | Automatic stiff/non-stiff switching (Adams ↔ BDF) | General purpose. Handles both the benign and the stiff parameter regions an optimizer visits. |
+| `'RK45'` (**default fallback**) | Explicit Runge-Kutta 5(4) | Non-stiff problems. Robust fallback when LSODA reports failure. |
+| `'RK23'` | Explicit Runge-Kutta 3(2) | Non-stiff problems at loose tolerances. |
+| `'DOP853'` | Explicit Runge-Kutta 8 | Non-stiff problems at very tight tolerances. |
+| `'BDF'` | Implicit backward differentiation | Stiff problems, e.g. A->B->C with rate constants many orders of magnitude apart. |
+| `'Radau'` | Implicit Runge-Kutta (Radau IIA, order 5) | Stiff problems that need high accuracy. |
+
+Each ODE solve tries the **primary** solver first and, only if that fails, the
+**fallback** solver. A warning is issued when the fallback is used.
+
+### `solver_options` reference
+
+| Key | Default | Meaning |
+|---|---|---|
+| `primary_solver` | `'LSODA'` | Method tried first. |
+| `fallback_solver` | `'RK45'` | Method tried if the primary fails. Set to `None` to disable the fallback. |
+| `rtol` | `1e-6` | Relative tolerance. |
+| `atol` | `1e-9` | Absolute tolerance. |
+| `max_rhs_evals` | `20000` | Per-solve cap on right-hand-side evaluations. A pathological parameter set fails fast instead of hanging the optimizer. |
+| `chunk_size` | `2000` | Predictions longer than this many time points are integrated in chunks. |
+
+Any key you omit keeps its default (see `akts.simulation.DEFAULT_SOLVER_OPTIONS`).
+
+```python
+from akts import fit_kinetic_model, predict_conversion
+
+# Stiff consecutive reaction: implicit solvers for both attempts
+fit = fit_kinetic_model(
+    datasets, 'A->B->C', {'f1_model': 'F1', 'f2_model': 'F1'},
+    initial_guesses={'Ea1': 85e3, 'A1': 1e11, 'Ea2': 95e3, 'A2': 1e12},
+    solver_options={'primary_solver': 'BDF', 'fallback_solver': 'Radau'},
+)
+
+# Previous default order (RK45 first, LSODA as fallback)
+prediction = predict_conversion(
+    fit, temperature_program=lambda t: 298.15, simulation_time_sec=t_eval,
+    solver_options={'primary_solver': 'RK45', 'fallback_solver': 'LSODA'},
+)
+
+# Single solver, no fallback, tighter tolerances
+opts = {'primary_solver': 'LSODA', 'fallback_solver': None, 'rtol': 1e-8, 'atol': 1e-11}
+```
+
+Changing the solver changes fitted parameters only within the integration
+tolerance. If two solvers give noticeably different fits, tighten `rtol`/`atol`
+until they agree.
+
+### Optimizer time budget
+
+`fit_kinetic_model(..., optimizer_options={'max_seconds': 120})` caps the
+wall-clock time of one fit. The default is 60 s per fitted parameter. In
+`run_bootstrap(..., timeout_per_replicate=30)` the timeout also becomes each
+replicate's optimizer budget.
+
+### Reproducible bootstraps
+
+Bootstrap resampling is random. Pass `random_state` to get identical results
+on every run, independent of `n_jobs` or the order in which workers finish:
+
+```python
+boot = run_bootstrap(datasets, fit, n_iterations=200, random_state=12345)
+
+results = auto_model_isothermal_data(files, predict=(2, 'year'), random_state=12345)
+```
+
+`random_state` accepts an `int`, a `numpy.random.SeedSequence` or a
+`numpy.random.Generator`. `run_bootstrap_friedman()` accepts it as well.
 
 ## See Also
 

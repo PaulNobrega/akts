@@ -79,6 +79,10 @@ class TestRegulatoryShelfLifePlot:
         legend = ax.get_legend()
         assert legend is not None
         assert len(legend.get_texts()) >= 5  # Prediction, CI, threshold, mean, conservative
+        ci_edge_lines = [line for line in ax.lines if line.get_label() == '_nolegend_']
+        assert len(ci_edge_lines) == 2
+        assert np.allclose(ci_edge_lines[0].get_ydata(), prediction_result.conversion_ci[0] * 100)
+        assert np.allclose(ci_edge_lines[1].get_ydata(), prediction_result.conversion_ci[1] * 100)
 
     def test_plot_without_confidence_interval(self):
         """Test plot when no confidence interval is available."""

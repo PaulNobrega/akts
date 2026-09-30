@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple, Dict, Union
 import warnings
 
 from .datatypes import IsoResult, FitResult, KineticDataset, PredictionResult, BootstrapResult
+from .utils import R_GAS, seconds_per_time_unit
 
 
 def plot_ea_vs_alpha(
@@ -140,14 +141,8 @@ def plot_fit_overlay(
         fig = ax.get_figure()
 
     # Time conversion factors
-    time_conversion = {
-        'seconds': 1.0,
-        'hours': 1 / 3600,
-        'days': 1 / (24 * 3600),
-        'months': 1 / (30.44 * 24 * 3600),
-        'years': 1 / (365.25 * 24 * 3600)
-    }
-    time_factor = time_conversion.get(time_units, 1.0)
+    # seconds -> time_units, i.e. the inverse of utils.TIME_UNITS_TO_SECONDS
+    time_factor = 1.0 / seconds_per_time_unit(time_units)
 
     # Normalize predictions to one optional prediction per dataset.
     if isinstance(prediction, (list, tuple)):
@@ -268,14 +263,8 @@ def plot_bootstrap_ci_bands(
         fig = ax.get_figure()
 
     # Time conversion
-    time_conversion = {
-        'seconds': 1.0,
-        'hours': 1 / 3600,
-        'days': 1 / (24 * 3600),
-        'months': 1 / (30.44 * 24 * 3600),
-        'years': 1 / (365.25 * 24 * 3600)
-    }
-    time_factor = time_conversion.get(time_units, 1.0)
+    # seconds -> time_units, i.e. the inverse of utils.TIME_UNITS_TO_SECONDS
+    time_factor = 1.0 / seconds_per_time_unit(time_units)
 
     time_plot = prediction.time * time_factor
     conversion_pct = prediction.conversion * 100
@@ -353,7 +342,7 @@ def plot_arrhenius(
 
     Ea = fit_result.parameters['Ea']
     A = fit_result.parameters['A']
-    R = 8.314  # Gas constant
+    R = R_GAS  # Match the gas constant used everywhere else in the library (utils.R_GAS)
 
     # Determine temperature range from data if available, otherwise use default
     if datasets and len(datasets) > 0:
@@ -363,10 +352,15 @@ def plot_arrhenius(
     else:
         T_min, T_max = 273, 400
 
-    # Plot bootstrap CI bands if available
-    if bootstrap_result is not None and hasattr(bootstrap_result, 'replicate_params'):
-        # Extract Ea and A from bootstrap replicates
-        replicate_params = bootstrap_result.replicate_params
+    # Plot bootstrap CI band if available. Replicate (Ea, A) pairs come from
+    # raw_parameter_list when the bootstrap kept them (return_replicate_params=True),
+    # otherwise from parameter_distributions, which is always populated and keeps
+    # each replicate's Ea and A at the same index.
+    if bootstrap_result is not None:
+        replicate_params = bootstrap_result.raw_parameter_list
+        dists = bootstrap_result.parameter_distributions or {}
+        if not replicate_params and 'Ea' in dists and 'A' in dists:
+            replicate_params = [{'Ea': float(e), 'A': float(a)} for e, a in zip(dists['Ea'], dists['A'])]
         if replicate_params and len(replicate_params) > 0:
             # Generate predictions for each replicate
             T_range = np.linspace(T_min, T_max, 100)
@@ -382,13 +376,15 @@ def plot_arrhenius(
 
             if ln_k_replicates:
                 ln_k_array = np.array(ln_k_replicates)
-                ln_k_lower = np.nanpercentile(ln_k_array, 2.5, axis=0)
-                ln_k_upper = np.nanpercentile(ln_k_array, 97.5, axis=0)
+                tail = (1.0 - bootstrap_result.confidence_level) / 2.0 * 100.0
+                ln_k_lower = np.nanpercentile(ln_k_array, tail, axis=0)
+                ln_k_upper = np.nanpercentile(ln_k_array, 100.0 - tail, axis=0)
 
                 # Plot CI band
                 ax.fill_between(
                     inv_T, ln_k_lower, ln_k_upper,
-                    alpha=0.25, color='blue', label='95% CI'
+                    alpha=0.25, color='blue',
+                    label=f'{bootstrap_result.confidence_level:.0%} CI'
                 )
 
     # Create temperature range for fitted line
@@ -402,6 +398,7 @@ def plot_arrhenius(
     if datasets and len(datasets) > 0:
         # For F1 model, k can be estimated from slope of -ln(1-α) vs t
         # For other models, this is approximate
+        data_label_used = False
         for ds in datasets:
             T_mean = np.mean(ds.temperature)
             # Simple rate estimation: k ≈ α_final / t_final for small conversions
@@ -420,26 +417,124 @@ def plot_arrhenius(
                         inv_T_data = 1000 / T_mean
                         ax.scatter(inv_T_data, ln_k_data, s=80, c='red',
                                  edgecolors='black', linewidths=1.5, zorder=5,
-                                 label='Data points' if ds == datasets[0] else '')
+                                 label='_nolegend_' if data_label_used else 'Data points')
+                        data_label_used = True
 
     # Add fit parameters as text
     Ea_kJ = Ea / 1000
     text = f'Ea = {Ea_kJ:.1f} kJ/mol\nln(A) = {np.log(A):.2f}\nA = {A:.2e} s⁻¹'
+    # ln k falls linearly with 1000/T (Ea > 0), so the line always runs from the
+    # upper-left to the lower-right corner. Keep the annotations in the two
+    # corners it never crosses: parameters upper-right, legend lower-left.
     ax.text(
-        0.05, 0.95,
+        0.97, 0.95,
         text,
         transform=ax.transAxes,
         fontsize=10,
         verticalalignment='top',
-        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+        horizontalalignment='right',
+        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.85),
+        zorder=10,
     )
 
     ax.set_xlabel('1000/T (K⁻¹)', fontsize=12, fontweight='bold')
     ax.set_ylabel('ln(k)', fontsize=12, fontweight='bold')
     ax.set_title('Arrhenius Plot', fontsize=14, fontweight='bold')
-    ax.legend(loc='best', fontsize=9)
+    ax.margins(x=0.08, y=0.15)  # breathing room between the line and the corner boxes
+    legend = ax.legend(loc='lower left', fontsize=9, framealpha=0.9)
+    legend.set_zorder(10)
     ax.grid(True, alpha=0.3)
 
+    plt.tight_layout()
+    return fig
+
+
+def plot_friedman_arrhenius(
+    iso_result: IsoResult,
+    datasets: List[KineticDataset],
+    alpha_levels: Optional[List[float]] = None,
+    n_levels: int = 5,
+    figsize: Tuple[float, float] = (10, 6),
+    ax: Optional[plt.Axes] = None,
+) -> Figure:
+    """
+    Model-free (Friedman) Arrhenius plot: ln(dα/dt) vs 1000/T at fixed conversions.
+
+    This is the regression Friedman analysis actually performs. At each
+    conversion level α, the measured rates from every temperature are plotted
+    against 1/T. The fitted line's slope is -Ea(α)/R and its intercept is
+    ln[A·f(α)]. Use it in place of plot_arrhenius() for model-free results,
+    which have no single Ea/A pair.
+
+    Parameters
+    ----------
+    iso_result : IsoResult
+        Result of run_friedman() (Ea and ln_A_f_alpha populated).
+    datasets : List[KineticDataset]
+        The datasets the analysis was run on.
+    alpha_levels : list of float, optional
+        Conversions to show. Defaults to ``n_levels`` resolved levels spread
+        evenly (in log space) over the range the analysis resolved.
+    n_levels : int, default=5
+        Number of levels when alpha_levels is None.
+    figsize : Tuple[float, float], default=(10, 6)
+    ax : plt.Axes, optional
+
+    Returns
+    -------
+    Figure
+    """
+    from .isoconversional import _prepare_iso_data
+
+    if iso_result.Ea is None or iso_result.ln_A_f_alpha is None:
+        raise ValueError("plot_friedman_arrhenius requires a Friedman IsoResult (Ea and ln_A_f_alpha).")
+
+    resolved = np.flatnonzero(np.isfinite(iso_result.Ea) & np.isfinite(iso_result.ln_A_f_alpha))
+    if resolved.size == 0:
+        raise ValueError("The Friedman result has no resolved conversion levels to plot.")
+    if alpha_levels is None:
+        picks = np.unique(np.round(np.linspace(0, resolved.size - 1, min(n_levels, resolved.size))).astype(int))
+        indices = resolved[picks]
+    else:
+        indices = np.array([resolved[np.argmin(np.abs(iso_result.alpha[resolved] - a))] for a in alpha_levels])
+        indices = np.unique(indices)
+
+    iso_data = _prepare_iso_data(datasets, iso_result.alpha)
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.get_figure()
+
+    colors = plt.get_cmap('viridis')(np.linspace(0, 0.9, len(indices)))
+    all_x = []
+    for color, i in zip(colors, indices):
+        alpha = float(iso_result.alpha[i])
+        inv_T, ln_rate = [], []
+        for ds_data in iso_data['datasets']:
+            rate, T = ds_data['dadt'][i], ds_data['T'][i]
+            if np.isfinite(rate) and rate > 0 and np.isfinite(T) and T > 0:
+                inv_T.append(1000.0 / T)
+                ln_rate.append(np.log(rate))
+        label = f"α = {alpha:.3g}: Ea = {iso_result.Ea[i] / 1000:.1f} kJ/mol"
+        if inv_T:
+            ax.scatter(inv_T, ln_rate, color=color, edgecolors='black', linewidths=0.5, s=60, zorder=5)
+            all_x.extend(inv_T)
+            x_line = np.linspace(min(inv_T), max(inv_T), 50)
+        else:
+            x_line = np.linspace(1000.0 / 373.15, 1000.0 / 273.15, 50)
+        # ln(dα/dt) = ln[A f(α)] - Ea/(R T), with x = 1000/T  =>  slope -Ea/(1000 R)
+        y_line = iso_result.ln_A_f_alpha[i] - iso_result.Ea[i] * x_line / (1000.0 * R_GAS)
+        ax.plot(x_line, y_line, color=color, linewidth=2, label=label)
+
+    ax.set_xlabel('1000/T (K⁻¹)', fontsize=12, fontweight='bold')
+    ax.set_ylabel('ln(dα/dt)  [ln(s⁻¹)]', fontsize=12, fontweight='bold')
+    ax.set_title('Friedman (Model-Free) Arrhenius Plot', fontsize=14, fontweight='bold')
+    ax.margins(x=0.08, y=0.12)
+    # Lines fall left-to-right (Ea > 0), so the lower-left corner stays clear.
+    legend = ax.legend(loc='lower left', fontsize=9, framealpha=0.9)
+    legend.set_zorder(10)
+    ax.grid(True, alpha=0.3)
     plt.tight_layout()
     return fig
 
@@ -555,14 +650,8 @@ def plot_multi_temperature_data(
     else:
         fig = ax.get_figure()
 
-    time_conversion = {
-        'seconds': 1.0,
-        'hours': 1 / 3600,
-        'days': 1 / (24 * 3600),
-        'months': 1 / (30.44 * 24 * 3600),
-        'years': 1 / (365.25 * 24 * 3600)
-    }
-    time_factor = time_conversion.get(time_units, 1.0)
+    # seconds -> time_units, i.e. the inverse of utils.TIME_UNITS_TO_SECONDS
+    time_factor = 1.0 / seconds_per_time_unit(time_units)
 
     temps_seen = set()
     for ds in datasets:

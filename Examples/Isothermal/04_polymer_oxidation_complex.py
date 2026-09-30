@@ -124,8 +124,8 @@ def main():
     results = auto_model_isothermal_data(
         data_files=datasets,
 
-        # Predict service life at 25°C for 10 years
-        predict=(10, 'year', 25),
+        # Predict service life at 75°C for 10 years
+        predict=(10, 'year', 75+273.15),
 
         # Units
         input_temperature_units='K',
@@ -159,9 +159,10 @@ def main():
 
     for model in results['top_models'][:6]:
         name = model['model_name']
-        r2 = model['statistics']['r_squared']
-        bic = model['statistics']['bic']
-        delta_bic = model['statistics'].get('delta_bic', 0)
+        stats = model['stats']  # ranked top_models use 'stats'; selected_model uses 'statistics'
+        r2 = stats['r_squared']
+        bic = stats['bic']
+        delta_bic = bic - results['top_models'][0]['stats']['bic']
 
         # Categorize mechanism
         if 'A->B->C' in name:

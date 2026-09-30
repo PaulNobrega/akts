@@ -60,7 +60,7 @@ def generate_mab_aggregation_data():
         else:  # 37°C and 45°C
             time_weeks = np.array([0, 1, 2, 4, 8, 12, 16, 20])  # Up to 20 weeks
 
-        time_sec = time_weeks * 7 * 24 * 3600  # weeks to seconds
+        time_sec = time_weeks * 7.0 * 24 * 3600  # weeks to seconds (float, so alpha below is float too)
 
         # Autocatalytic kinetics (SB model approximation)
         k = A * np.exp(-Ea / (8.314 * T_K))
@@ -132,16 +132,16 @@ def main():
     results = auto_model_isothermal_data(
         data_files=datasets,
 
-        # Predict at refrigerated storage (5°C) for 2 years
-        predict=(2, 'year', 5),
+        # Predict at room temperature (30°C) for 2 years
+        predict=(2, 'year', 30+273.15),
 
         # Simulate shipping excursion: cold chain break
         # 5 days at 5°C -> 3 days at 30°C (shipping) -> back to 5°C
         simulate=[
-            (0, 5),      # Start at refrigerated
-            (5, 5),      # 5 days storage
-            (8, 30),     # 3 days shipping at room temp
-            (30, 5),     # Return to refrigerated for 22 days
+            (0, 5+273.15),      # Start at refrigerated
+            (5, 5+273.15),      # 5 days storage
+            (8, 30+273.15),     # 3 days shipping at room temp
+            (30, 5+273.15),     # Return to refrigerated for 22 days
         ],
         simulate_time_unit='days',
 
@@ -173,11 +173,13 @@ def main():
     # Model comparison
     print("Top 5 Models (Ranked by BIC):")
     print("-" * 80)
+    best_bic = results['top_models'][0]['stats']['bic']
     for i, model in enumerate(results['top_models'][:5], 1):
+        stats = model['stats']  # ranked top_models use 'stats'; selected_model uses 'statistics'
         print(f"{i}. {model['model_name']:15s} "
-              f"R²={model['statistics']['r_squared']:.4f}  "
-              f"BIC={model['statistics']['bic']:.1f}  "
-              f"ΔBIC={model['statistics'].get('delta_bic', 0):.1f}")
+              f"R²={stats['r_squared']:.4f}  "
+              f"BIC={stats['bic']:.1f}  "
+              f"ΔBIC={stats['bic'] - best_bic:.1f}")
 
     print()
     selected = results['selected_model']
@@ -227,7 +229,6 @@ def main():
         print(f"  Final HMW after excursion: {final_agg:.1f}%")
 
         # Find aggregation at end of shipping (day 8)
-        import numpy as np
         times = np.array(sim['time'])
         convs = np.array(sim['conversion_mean'])
         day8_idx = np.argmin(np.abs(times - 8 * 86400))

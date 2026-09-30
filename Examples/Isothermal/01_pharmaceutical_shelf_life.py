@@ -1,19 +1,23 @@
 """
-Example 1: Pharmaceutical Shelf-Life Prediction with ICH Q1E Compliance
+Example 1: Pharmaceutical Shelf-Life Analysis with ICH Q1E-Style Regression
 ========================================================================
 
 Scientific Context:
 - Drug product stability study at 25°C, 30°C, and 40°C
-- ICH Q1E guideline compliance for shelf-life estimation
-- One-sided 95% confidence intervals (conservative)
+- Regression-based shelf-life estimate at label storage temperature
+- Automatic linear-versus-quadratic trend selection
+- One-sided 95% confidence limit (conservative)
 - Extrapolation ceiling validation
 
 Key Features Demonstrated:
-✓ ICH Q1E regulatory compliance
-✓ Bootstrap confidence intervals
+✓ ICH Q1E-style regression/ANCOVA shelf-life analysis
+✓ Separate bootstrap confidence intervals for kinetic model predictions
 ✓ Shelf-life prediction at label storage temperature
 ✓ Model selection with simplicity preference
-✓ Professional HTML report for regulatory submission
+✓ Professional HTML report with selected shelf-life trend
+
+This synthetic demonstration is not a claim of regulatory compliance. Validate
+the study design, trend assumptions, and specification limit for real submissions.
 
 Data: Aspirin tablet degradation (API content loss over time)
 """
@@ -24,8 +28,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from akts import (auto_model_isothermal_data, KineticDataset,
-                  time_to_conversion, calculate_ich_q1e_ceiling)
+from akts import auto_model_isothermal_data, KineticDataset
 
 
 def generate_aspirin_data():
@@ -75,10 +78,10 @@ def generate_aspirin_data():
 
 
 def main():
-    """Pharmaceutical stability analysis with ICH Q1E compliance."""
+    """Demonstrate model selection and regression-based shelf-life analysis."""
 
     print("=" * 80)
-    print(" ICH Q1E Pharmaceutical Shelf-Life Prediction")
+    print(" Pharmaceutical Shelf-Life Regression Example")
     print("=" * 80)
     print()
     print("Scenario: Aspirin tablet stability study")
@@ -97,15 +100,20 @@ def main():
     output_dir = Path(__file__).parent / "output"
     output_dir.mkdir(exist_ok=True)
 
-    # Run ICH Q1E compliant analysis
-    print("Running ICH Q1E compliant stability analysis...")
+    # Run regression-based shelf-life analysis
+    print("Running shelf-life analysis...")
     print("-" * 80)
 
     results = auto_model_isothermal_data(
         data_files=datasets,
 
-        # ICH Q1E: Predict at label storage (25°C) for regulatory shelf-life
+        # Prediction horizon and shelf-life storage condition are configured separately.
         predict=(3, 'year', 25),
+        shelf_life_temperature_C=25.0,
+        shelf_life_target_conversion=0.05,
+        shelf_life_confidence_level=0.95,
+        shelf_life_is_long_term=True,
+        shelf_life_nonlinearity_p_threshold=0.05,
 
         # Unit conversions
         input_temperature_units='K',
@@ -115,7 +123,7 @@ def main():
         models_to_try=['F0', 'F1', 'F2', 'A2', 'A3', 'R2', 'R3', 'D2', 'D3'],
         include_ode_models=False,  # Not needed for first-order degradation
 
-        # ICH Q1E: Bootstrap for confidence intervals
+        # Bootstrap is for kinetic model prediction uncertainty, not shelf-life regression.
         bootstrap_iterations=100,
 
         # Report with regulatory compliance section
@@ -128,7 +136,7 @@ def main():
 
     print()
     print("=" * 80)
-    print(" Analysis Complete - ICH Q1E Results")
+    print(" Analysis Complete - Shelf-Life Results")
     print("=" * 80)
     print()
 
@@ -144,57 +152,23 @@ def main():
     print(f"  BIC = {stats['bic']:.1f}")
     print()
 
-    # ICH Q1E shelf-life calculation
-    print("ICH Q1E Shelf-Life Estimation:")
+    # Shelf-life estimate is computed separately from bootstrap prediction intervals.
+    print("Regression-Based Shelf-Life Estimation:")
     print("-" * 80)
-
-    # Get bootstrap result
-    bootstrap_result = results['bootstrap_results'].get(selected['model_name'])
-
-    if bootstrap_result:
-        # Calculate shelf-life at 5% degradation (95% API content)
-        from akts import fit_kinetic_model
-
-        # Recreate fit result for time_to_conversion
-        fit_result_selected = None
-        if 'fit_results' in results:
-            fit_result_selected = results['fit_results'].get(selected['model_name'])
-
-        if fit_result_selected:
-            # One-sided 95% CI (ICH Q1E requirement)
-            shelf_life = time_to_conversion(
-                fit_result=fit_result_selected,
-                target_conversion=0.05,  # 5% degradation
-                temperature_K=298.15,    # 25°C storage
-                bootstrap_result=bootstrap_result,
-                one_sided_ci=True        # ICH Q1E: one-sided lower bound
-            )
-
-            if shelf_life['time_sec']:
-                mean_months = shelf_life['time_sec'] / (30.44 * 24 * 3600)
-                lower_months = shelf_life['time_lower_sec'] / (30.44 * 24 * 3600) if shelf_life['time_lower_sec'] else None
-
-                print(f"  Mean shelf-life: {mean_months:.1f} months")
-                if lower_months:
-                    print(f"  95% Lower Bound: {lower_months:.1f} months (ICH Q1E)")
-                print()
-
-                # ICH Q1E extrapolation ceiling
-                study_duration_months = 24  # 24-month long-term data
-                ceiling = calculate_ich_q1e_ceiling(study_duration_months, is_long_term=True)
-
-                print(f"ICH Q1E Extrapolation Guidance:")
-                print(f"  Study duration: {study_duration_months} months")
-                print(f"  Extrapolation ceiling: {ceiling:.0f} months")
-
-                if lower_months and lower_months <= ceiling:
-                    print(f"  ✓ COMPLIANT: Shelf-life within ICH Q1E guidelines")
-                    print(f"  -> Proposed label shelf-life: {int(lower_months)} months")
-                elif lower_months:
-                    print(f"  ⚠ CAUTION: Shelf-life exceeds ICH Q1E ceiling")
-                    print(f"  -> Additional stability data recommended")
-                    print(f"  -> Conservative shelf-life: {int(ceiling)} months")
-                print()
+    shelf_life = results.get('regulatory')
+    if shelf_life:
+        print(f"  Selected trend: {shelf_life['trend_type']}")
+        print(f"  Regression method: {shelf_life['regression_method']}")
+        print(f"  Storage temperature: {shelf_life['storage_temp_K'] - 273.15:.1f}°C")
+        print(f"  Mean shelf-life: {shelf_life['shelf_life_months']:.1f} months")
+        confidence = shelf_life['shelf_life_confidence_level']
+        print(f"  One-sided {confidence:.0%} shelf-life bound: {shelf_life['shelf_life_lower_95']:.1f} months")
+        print(f"  Extrapolation ceiling: {shelf_life['ich_ceiling_months']:.1f} months")
+        if shelf_life['curvature_p_value'] is not None:
+            print(f"  Curvature test p-value: {shelf_life['curvature_p_value']:.4g}")
+    else:
+        print("  Estimate unavailable: no usable observations at the configured shelf-life temperature.")
+    print()
 
     # Prediction results
     if results['predictions']:
@@ -217,10 +191,9 @@ def main():
     # Report location
     print("=" * 80)
     print(f"Regulatory Report: {results['report_path']}")
-    print("  - Includes ICH Q1E compliance section")
-    print("  - One-sided 95% confidence intervals")
-    print("  - Extrapolation ceiling validation")
-    print("  - Ready for regulatory submission")
+    print("  - Includes regression-based shelf-life analysis when matching data are available")
+    print("  - Reports selected linear/quadratic trend and one-sided confidence limit")
+    print("  - Review study design and trend assumptions before regulatory use")
     print("=" * 80)
 
 

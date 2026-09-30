@@ -29,7 +29,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from akts import KineticDataset, simulate_kinetics, predict_conversion, auto_model_isothermal_data
+from akts import KineticDataset, simulate_kinetics, predict_conversion, auto_model_isothermal_data, models
 from akts.isoconversional import run_friedman, run_bootstrap_friedman
 from akts.helpers import _setup_model_configs, _wrap_friedman_as_fit_result
 
@@ -205,15 +205,10 @@ class TestAutoModelIsothermalDataWithFriedman:
         assert 'F1' in results['selected_model']['model_name']
 
 
-class TestFriedmanAutoDetection:
-    """Friedman has no include_ode_models-style opt-in flag: it's added to the
-    default model list automatically based on how many distinct temperatures
-    the loaded data actually has (>=3 needed for a meaningful per-alpha
-    regression -- 2 points give zero degrees of freedom for error estimation).
-    A study run at 1-2 temperatures should never see it (silently omitted, not
-    included-and-failing); >=3 should always see it without asking for it."""
+class TestFriedmanModelSelection:
+    """Friedman is opt-in and requires at least three temperatures for a fit."""
 
-    def test_included_by_default_with_three_temperatures(self):
+    def test_not_included_by_default_with_three_temperatures(self):
         datasets = _make_isothermal_datasets(temps_K=(313.0, 328.0, 343.0))
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
@@ -221,9 +216,9 @@ class TestFriedmanAutoDetection:
                 data_files=datasets, top_n=20, bootstrap_iterations=0, report_path=None,
             )
         model_names = [m['model_name'] for m in results['top_models']]
-        assert any('Friedman' in name for name in model_names)
+        assert not any('Friedman' in name for name in model_names)
 
-    def test_included_by_default_with_four_temperatures(self):
+    def test_not_included_by_default_with_four_temperatures(self):
         datasets = _make_isothermal_datasets()  # TEMPS has 4 distinct values
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
@@ -231,7 +226,18 @@ class TestFriedmanAutoDetection:
                 data_files=datasets, top_n=20, bootstrap_iterations=0, report_path=None,
             )
         model_names = [m['model_name'] for m in results['top_models']]
-        assert any('Friedman' in name for name in model_names)
+        assert not any('Friedman' in name for name in model_names)
+
+    def test_explicit_empirical_selection_does_not_add_friedman(self):
+        datasets = _make_isothermal_datasets()
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            results = auto_model_isothermal_data(
+                data_files=datasets, models_to_try=models.empirical.all,
+                top_n=20, bootstrap_iterations=0, report_path=None,
+            )
+        model_names = [m['model_name'] for m in results['top_models']]
+        assert not any('Friedman' in name for name in model_names)
 
     def test_excluded_by_default_with_two_temperatures(self):
         datasets = _make_isothermal_datasets(temps_K=(313.0, 343.0))
@@ -253,11 +259,9 @@ class TestFriedmanAutoDetection:
         model_names = [m['model_name'] for m in results['top_models']]
         assert not any('Friedman' in name for name in model_names)
 
-    def test_explicit_models_to_try_bypasses_auto_detection(self):
-        # If the user names Friedman explicitly, it runs (and fails gracefully,
-        # per test_single_dataset_fails_gracefully_not_crash) regardless of the
-        # auto-detection heuristic -- auto-detection only governs the *default*
-        # list when models_to_try is not given.
+    def test_explicit_friedman_with_two_temperatures_fails_gracefully(self):
+        # Friedman is selected explicitly, but two temperatures cannot provide
+        # enough information for its per-conversion regression.
         datasets = _make_isothermal_datasets(temps_K=(313.0, 343.0))
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')

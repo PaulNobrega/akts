@@ -2,10 +2,14 @@
 
 # Import key classes and functions to expose them at the top level
 from .datatypes import KineticDataset, FitResult, IsoResult, BootstrapResult, PredictionResult
-from .core import (fit_kinetic_model, run_bootstrap, predict_conversion,
-                   simulate_kinetics, discover_kinetic_models, predict_conversion_model_free, rank_models)
+from .simulation import simulate_kinetics
+from .fitting import fit_kinetic_model, discover_kinetic_models
+from .bootstrap import BOOTSTRAP_METHODS, run_bootstrap, run_bootstrap_empirical
+from .prediction import predict_conversion, predict_conversion_model_free
+from .ranking import rank_models
 from .isoconversional import (run_friedman, run_kas, run_ofw, run_vyazovkin,
-                               run_kissinger, estimate_compensation_parameters)
+                               run_kissinger, run_bootstrap_friedman,
+                               estimate_compensation_parameters)
 # Expose model registration and listing functions
 from .models import (register_f_alpha_model, register_ode_system, list_available_models,
                      F_ALPHA_MODELS, ODE_SYSTEMS)
@@ -18,8 +22,7 @@ from .validation import run_leave_one_out_cv
 # Expose export utilities
 from .utils import export_prediction_report
 # Expose plotting convenience functions
-from .plotting import (plot_ea_vs_alpha, plot_fit_overlay, plot_bootstrap_ci_bands,
-                       plot_arrhenius, plot_parameter_distributions, plot_multi_temperature_data)
+from .plotting import (plot_ea_vs_alpha, plot_fit_overlay, plot_bootstrap_ci_bands, plot_arrhenius, plot_friedman_arrhenius, plot_parameter_distributions, plot_multi_temperature_data)
 # Expose JSON utilities for API integration
 from .json_utils import parse_json_data, serialize_results_to_json, convert_numpy_to_python
 # Expose model selector for IDE autocomplete
@@ -38,6 +41,9 @@ __all__ = [
     # Core functions
     'fit_kinetic_model',
     'run_bootstrap',
+    'run_bootstrap_empirical',
+    'run_bootstrap_friedman',
+    'BOOTSTRAP_METHODS',
     'predict_conversion',
     'simulate_kinetics',
     'discover_kinetic_models',
@@ -57,6 +63,7 @@ __all__ = [
     'plot_fit_overlay',
     'plot_bootstrap_ci_bands',
     'plot_arrhenius',
+    'plot_friedman_arrhenius',
     'plot_parameter_distributions',
     'plot_multi_temperature_data',
     # Isoconversional functions

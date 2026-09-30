@@ -224,6 +224,37 @@ F_ALPHA_MODELS: Dict[str, FAlphaCallable] = {
     "R3": f_contracting_rn,
     "Bna": f_prout_tompkins,
 }
+# User-facing display names, shared by helpers.py progress messages and reporting.py.
+MODEL_DISPLAY_NAMES = {
+    # f(alpha) models
+    'F0': 'F0 (zero-order)',
+    'F1': 'F1 (first-order)',
+    'F2': 'F2 (second-order)',
+    'F3': 'F3 (third-order)',
+    'A2': 'A2 (Avrami-Erofeev, n=2)',
+    'A3': 'A3 (Avrami-Erofeev, n=3)',
+    'R2': 'R2 (contracting area)',
+    'R3': 'R3 (contracting volume)',
+    'D2': 'D2 (2D diffusion)',
+    'D3': 'D3 (3D diffusion, Jander)',
+    'D4': 'D4 (3D diffusion, Ginstling-Brounshtein)',
+    'D1': 'D1 (1D diffusion)',
+    'SB_mn': 'SB(m,n) (Sestak-Berggren, autocatalytic)',
+    'Bna': 'Bna (Prout-Tompkins, autocatalytic)',
+    # ODE models (multi-step)
+    'A->B->C': 'A->B->C (consecutive reactions)',
+    'A+B->C': 'A+B->C (bimolecular)',
+    # Model-free (isoconversional)
+    'Friedman': 'Friedman (model-free isoconversional)',
+}
+
+
+def model_display_name(model_name: str) -> str:
+    """'F1_model' / 'F1' -> 'F1 (first-order)'; unknown names are returned without the _model suffix."""
+    base = model_name.replace('_model', '')
+    return MODEL_DISPLAY_NAMES.get(base, base)
+
+
 # Store default parameters separately if needed by get_model_info
 F_ALPHA_DEFAULT_PARAMS = {
     "F0": {'n': 0.0}, "F1": {'n': 1.0}, "F2": {'n': 2.0}, "F3": {'n': 3.0},

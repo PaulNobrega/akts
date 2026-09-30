@@ -95,16 +95,16 @@ top_n : int = 3                    # Top N models to analyze
 - Add them to `models_to_try`, for example `models.default + models.ode.all`.
 - Fits use multistart local optimization, retaining the result with the highest R².
 
-**Friedman model-free analysis**: `'Friedman'`
-- Added automatically when the loaded data spans **at least three distinct mean temperatures**, rounded to the nearest kelvin. Below that threshold, it is omitted unless explicitly named in `models_to_try`.
+**Friedman model-free analysis**: `'Friedman'` (opt-in)
+- Friedman is never added automatically. Include it in `models_to_try` when you want to run it. A meaningful fit requires **at least three distinct mean temperatures**, rounded to the nearest kelvin, with overlapping conversion ranges.
 - Fit as a real `FitResult` (`model_name='Friedman'`) so it competes in ranking/selection like any other model, and gets bootstrap confidence intervals like any other model — see [Model-free (isoconversional) prediction](api_reference.md#model-free-prediction-no-reaction-model-assumed).
 - The `alpha_levels` used internally adapt to how much conversion the data actually reaches (useful for accelerated-aging studies that only reach a few % conversion within practical timeframes) rather than assuming every dataset gets to ~95% conversion.
-- Naming it explicitly in `models_to_try` (see below) bypasses auto-detection and always runs it, regardless of temperature count.
+- If explicitly selected with fewer than three distinct temperatures, it may not produce a valid fit.
 
 **Custom selection**:
 ```python
-models_to_try=['F1', 'F2', 'A2']  # Only these three -- disables auto-detection of Friedman
-models_to_try=['F1', 'Friedman']  # Explicitly include Friedman regardless of temperature count
+models_to_try=['F1', 'F2', 'A2']  # Only these three; Friedman is not added
+models_to_try=['F1', 'Friedman']  # Explicitly include Friedman
 ```
 
 #### Bimolecular Reactant Ratio
@@ -118,11 +118,68 @@ Fixed `[B]₀/[A]₀` ratio used by the `A+B→C` bimolecular ODE model when it 
 ```python
 bootstrap_iterations : int = 100   # Confidence interval samples
 confidence_level : float = 0.95    # 95% confidence intervals
+bootstrap_method : str = 'monte_carlo'  # 'monte_carlo', 'parametric', 'residual'
 n_jobs : int = -1                  # Bootstrap workers; default leaves one CPU core free
 ```
 
-The worker count is capped at the number of bootstrap iterations. Set
-`n_jobs=1` to run bootstrap fits in a single worker process.
+`monte_carlo` is the default case bootstrap: complete observations are sampled
+with replacement within each dataset, preserving its row count. `parametric`
+generates Gaussian errors around fitted curves using residual-based standard
+deviations; `residual` resamples centered residuals with conversion-transition
+weights. Case resampling can omit measured time points and repeat others, so it
+may be unreliable for very sparse datasets.
+
+Select the method in the analysis call:
+
+```python
+from akts import auto_model_isothermal_data, models
+
+results = auto_model_isothermal_data(
+    data_files=data_files,
+    models_to_try=models.empirical.all,
+    bootstrap_iterations=200,
+    confidence_level=0.95,
+    bootstrap_method='residual',
+    random_state=12345,
+)
+
+print(results['summary']['bootstrap_method'])
+```
+
+The selected method is also recorded on each returned `BootstrapResult` as
+`bootstrap_method`. For direct use with a fitted empirical or Friedman model,
+see the [`run_bootstrap_empirical()` and `run_bootstrap_friedman()` API examples](api_reference.md#run_bootstrap).
+
+The worker count is capped at the number of bootstrap iterations. Set `n_jobs=1`
+to run bootstrap fits in a single worker process. These methods apply to kinetic
+model uncertainty; shelf-life trend analysis at the requested storage condition
+does not use bootstrap resampling. It requires observations within 0.5 K of that
+temperature and selects a linear or quadratic trend per batch using a nested F-test.
+When all batch trends are linear, ANCOVA tests slope poolability at α=0.25.
+Increasing degradation conversion uses its one-sided upper confidence limit for
+the conservative shelf-life time. The result is not itself a compliance determination.
+
+#### Shelf-Life Regression Settings
+```python
+shelf_life_temperature_C : float = 20.0
+shelf_life_target_conversion : float = 0.05
+shelf_life_confidence_level : float = 0.95
+shelf_life_is_long_term : bool = True
+shelf_life_nonlinearity_p_threshold : float = 0.05
+```
+
+Shelf life is evaluated independently of `predict_temperature_K`. For each usable
+batch at the requested temperature, a nested F-test compares linear and quadratic
+trends; quadratic is selected when the added curvature has `p` below the configured
+threshold. If all batches select linear trends, the ANCOVA common-slope check is
+applied. The report records the selected trend, method, curvature p-value,
+storage temperature, specification conversion, confidence level, and extrapolation
+category. The 20°C default requires data within 0.5 K of 20°C; otherwise the shelf-life
+estimate is unavailable unless another temperature is configured.
+
+This is an automated regression choice, not a determination of regulatory compliance.
+Review the observed data, residuals, specification limit, storage condition, and model
+assumptions before using a shelf-life estimate in a regulatory submission.
 
 #### Output Format
 ```python
@@ -316,9 +373,9 @@ The top-ranked model by combined score is not always the one that gets selected.
 
 [Model Selection Guide](model_selection_guide.md) explains this selection logic.
 
-### Time to Reach a Target Conversion
+### Model-Based Time to Target Conversion
 
-To answer "how long until X% degradation at a given storage temperature" directly (rather than reading it off a `predict` curve), use `time_to_conversion()`. It's the inverse of `predict_conversion()`: instead of "what's the conversion at time t", it answers "at what time does conversion first reach `alpha_target`" — the ICH Q1E "time to reach 5% degradation" question.
+To answer "how long until X% degradation at a given storage temperature" directly (rather than reading it off a `predict` curve), use `time_to_conversion()`. It is the inverse of `predict_conversion()` and can propagate bootstrap uncertainty for a fitted kinetic model. This is a model-based extrapolation utility, not the ICH Q1E shelf-life calculation.
 
 `time_to_conversion()` takes a `FitResult` directly (the kind returned by `fit_kinetic_model()`), so it's typically used alongside the manual/advanced fitting workflow:
 
@@ -347,6 +404,11 @@ if result['time_lower_sec'] is not None:
 ```
 
 `result['time_sec']` is `None` if the target conversion isn't reached within the (automatically extended) search window — this can happen for a very stable formulation at a low storage temperature.
+
+The shelf-life result generated by `auto_model_isothermal_data()` is separate from
+`time_to_conversion()`: it auto-selects a linear or quadratic time trend at the
+configured shelf-life temperature and applies an adverse-direction one-sided
+confidence limit, without bootstrap resampling.
 
 ## JSON Input/Output for Web APIs
 

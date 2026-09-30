@@ -5,7 +5,7 @@ from scipy.optimize import brentq
 from scipy.stats import linregress
 from scipy.optimize import minimize
 import warnings
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Union
 
 from .datatypes import KineticDataset, IsoResult, BootstrapResult
 from .utils import numerical_diff, R_GAS
@@ -23,6 +23,12 @@ def _spline_dadt_at_alpha(time_unique: np.ndarray, alpha_unique: np.ndarray,
     Smoothing strength (s) uses scipy's own heuristic (s ~ N * sigma^2), with
     sigma estimated from the residual of a quadratic fit to (t, alpha) as a
     practical noise proxy since the true measurement noise isn't known.
+
+    Known limitation: for sigmoidal (e.g. Avrami) curves that residual is mostly
+    model misfit rather than noise, so the spline is oversmoothed and early-alpha
+    rates come out too high. A true-noise estimate removes that bias but leaves
+    sparse (~25-point) curves too noisy to differentiate, so the trade-off is
+    left as is for now.
     """
     n = len(time_unique)
     t_at_alpha = np.full_like(alpha_levels, np.nan, dtype=float)
@@ -184,19 +190,16 @@ def run_bootstrap_friedman(
     n_iterations: int = 100,
     confidence_level: float = 0.95,
     alpha_levels: Optional[np.ndarray] = None,
+    random_state: Optional[Union[int, np.random.Generator]] = None,
+    bootstrap_method: str = 'monte_carlo',
 ) -> Optional[BootstrapResult]:
     """
     Bootstrap confidence intervals for a Friedman model-free result.
 
-    run_bootstrap()/_fit_on_resampled_data() (core.py) resample conversion
-    residuals from one ODE simulation and refit via scipy.optimize.minimize --
-    that doesn't apply here, since Friedman has no ODE simulation or optimizer
-    step; it's a per-alpha-level linear regression (linregress on ln(rate) vs
-    1/T). The natural bootstrap for a linear fit is to resample at the
-    regression-input level: for each alpha, resample the (ln_rate, inv_T) pairs
-    across datasets with replacement and recompute linregress. This is cheap
-    (index resampling + linregress, no simulation per replicate) and runs in a
-    plain loop -- no ProcessPoolExecutor needed even for hundreds of replicates.
+    ``monte_carlo`` resamples complete observed rows, ``residual`` resamples
+    centered conversion residuals, and ``parametric`` adds Gaussian conversion
+    errors with scales estimated from the fitted residuals. Each replicate reruns
+    the per-conversion Friedman regressions.
 
     Parameters
     ----------
@@ -210,6 +213,10 @@ def run_bootstrap_friedman(
         Confidence level for parameter_ci (e.g. 0.95 = 95%).
     alpha_levels : np.ndarray, optional
         Overrides iso_result.alpha if given.
+    random_state : int or np.random.Generator, optional
+        Seed (or generator) for reproducible resampling.
+    bootstrap_method : {'monte_carlo', 'parametric', 'residual'}, default='monte_carlo'
+        Synthetic-data method used for each replicate.
 
     Returns
     -------
@@ -225,50 +232,44 @@ def run_bootstrap_friedman(
         - median_parameters: median Ea(alpha)/ln_A_f_alpha(alpha) arrays, same
           keying as parameter_distributions.
     """
-    levels = alpha_levels if alpha_levels is not None else iso_result.alpha
-    iso_data = _prepare_iso_data(datasets, levels)
+    from .bootstrap import _make_resampled_datasets, _normalize_bootstrap_method
+    from .prediction import predict_conversion_model_free
 
-    # Per-alpha (ln_rate, inv_T) pairs available across datasets -- exactly
-    # what run_friedman() itself regresses on for each alpha level.
-    per_alpha_pairs = []
-    for i, alpha in enumerate(levels):
-        ln_rate, inv_T = [], []
-        for ds_data in iso_data['datasets']:
-            rate, T = ds_data['dadt'][i], ds_data['T'][i]
-            if np.isfinite(rate) and rate > 1e-12 and np.isfinite(T) and T > 0:
-                ln_rate.append(np.log(rate))
-                inv_T.append(1.0 / T)
-        per_alpha_pairs.append((np.array(ln_rate), np.array(inv_T)))
+    bootstrap_method = _normalize_bootstrap_method(bootstrap_method)
+    levels = alpha_levels if alpha_levels is not None else iso_result.alpha
+    fitted = [None] * len(datasets)
+    if bootstrap_method != 'monte_carlo':
+        for index, dataset in enumerate(datasets):
+            try:
+                prediction = predict_conversion_model_free(
+                    iso_result, (dataset.time, dataset.temperature), dataset.time
+                )
+                fitted[index] = prediction.conversion
+            except Exception as exc:
+                warnings.warn(f"Friedman bootstrap: prediction failed for dataset {index}: {exc}")
 
     n_alpha = len(levels)
     Ea_replicates = [[] for _ in range(n_alpha)]
     lnAf_replicates = [[] for _ in range(n_alpha)]
     raw_parameter_list = []
 
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(random_state)
     for _ in range(n_iterations):
-        rep_Ea = np.full(n_alpha, np.nan)
-        rep_lnAf = np.full(n_alpha, np.nan)
-        n_resolved = 0
-        for i, (ln_rate, inv_T) in enumerate(per_alpha_pairs):
-            if len(ln_rate) < 2:
-                continue
-            idx = rng.integers(0, len(ln_rate), size=len(ln_rate))
-            try:
-                res = linregress(inv_T[idx], ln_rate[idx])
-            except ValueError:
-                continue
-            if not np.isfinite(res.slope):
-                continue
-            rep_Ea[i] = -res.slope * R_GAS
-            rep_lnAf[i] = res.intercept
-            n_resolved += 1
-
-        if n_resolved >= 2:
-            for i in range(n_alpha):
-                if np.isfinite(rep_Ea[i]):
-                    Ea_replicates[i].append(rep_Ea[i])
-                    lnAf_replicates[i].append(rep_lnAf[i])
+        synthetic_datasets = _make_resampled_datasets(datasets, fitted, rng, bootstrap_method)
+        if not synthetic_datasets:
+            continue
+        try:
+            replicate = run_friedman(synthetic_datasets, alpha_levels=levels)
+        except Exception as exc:
+            warnings.warn(f"Friedman bootstrap replicate failed: {exc}")
+            continue
+        rep_Ea = np.asarray(replicate.Ea, dtype=float)
+        rep_lnAf = np.asarray(replicate.ln_A_f_alpha, dtype=float)
+        valid = np.isfinite(rep_Ea) & np.isfinite(rep_lnAf)
+        if np.sum(valid) >= 2:
+            for i in np.flatnonzero(valid):
+                Ea_replicates[i].append(rep_Ea[i])
+                lnAf_replicates[i].append(rep_lnAf[i])
             raw_parameter_list.append({'alpha': levels.copy(), 'Ea': rep_Ea, 'ln_A_f_alpha': rep_lnAf})
 
     if not raw_parameter_list:
@@ -301,6 +302,7 @@ def run_bootstrap_friedman(
         parameter_ci=parameter_ci,
         n_iterations=len(raw_parameter_list),
         confidence_level=confidence_level,
+        bootstrap_method=bootstrap_method,
         raw_parameter_list=raw_parameter_list,
         median_parameters=median_parameters,
     )

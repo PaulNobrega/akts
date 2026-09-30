@@ -1,9 +1,4 @@
-"""
-Regulatory-compliant plotting for ICH Q1E stability analysis.
-
-Creates plots that visualize shelf-life estimation with confidence intervals,
-suitable for regulatory submissions.
-"""
+"""Plot regression-based shelf-life estimates and configured reference limits."""
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -11,6 +6,7 @@ from typing import Dict, Optional, Tuple
 from matplotlib.figure import Figure
 
 from .datatypes import PredictionResult
+from .utils import SECONDS_PER_MONTH
 
 
 def create_regulatory_shelf_life_plot(
@@ -21,10 +17,11 @@ def create_regulatory_shelf_life_plot(
     study_duration_sec: Optional[float] = None,
     ich_ceiling_sec: Optional[float] = None,
     storage_temp_K: float = 298.15,
-    figsize: Tuple[float, float] = (10, 6)
+    figsize: Tuple[float, float] = (10, 6),
+    confidence_band_level: float = 0.95,
 ) -> Figure:
     """
-    Create ICH Q1E-compliant shelf-life plot.
+    Plot a regression-based shelf-life estimate and its confidence band.
 
     Shows model predictions with confidence intervals, target threshold,
     mean and conservative shelf-life estimates, and ICH Q1E extrapolation ceiling.
@@ -42,11 +39,13 @@ def create_regulatory_shelf_life_plot(
     study_duration_sec : float, optional
         Duration of experimental study in seconds
     ich_ceiling_sec : float, optional
-        ICH Q1E extrapolation ceiling in seconds
+        Configured shelf-life extrapolation ceiling in seconds
     storage_temp_K : float, default=298.15
         Storage temperature in Kelvin
     figsize : Tuple[float, float], default=(10, 6)
         Figure size in inches
+    confidence_band_level : float, default=0.95
+        Confidence level represented by prediction.conversion_ci.
 
     Returns
     -------
@@ -55,26 +54,16 @@ def create_regulatory_shelf_life_plot(
 
     Notes
     -----
-    This plot is designed for regulatory submissions following ICH Q1E guidelines.
-    It clearly shows:
-    - Model prediction (solid line)
-    - 95% confidence interval (shaded region)
-    - Target threshold (horizontal dashed line)
-    - Mean shelf-life estimate (vertical solid line)
-    - Conservative shelf-life (one-sided CI, vertical dashed line)
-    - Study duration (vertical dotted line, if provided)
-    - ICH Q1E ceiling (vertical dotted line, if provided)
+    The plot visualizes the selected regression and configured limits. It does not
+    establish regulatory compliance; validate the study design and model separately.
     """
     fig, ax = plt.subplots(figsize=figsize)
 
     # Convert time to months for display
-    time_months = prediction.time / (30.44 * 24 * 3600)
+    time_months = prediction.time / SECONDS_PER_MONTH
     conversion_pct = prediction.conversion * 100
 
-    # Plot model prediction
-    ax.plot(time_months, conversion_pct, 'b-', linewidth=2, label='Model Prediction')
-
-    # Plot confidence interval if available
+    # Draw the confidence band and its boundaries before the mean so narrow bands remain legible.
     if prediction.conversion_ci is not None:
         ci_lower_pct = prediction.conversion_ci[0] * 100
         ci_upper_pct = prediction.conversion_ci[1] * 100
@@ -82,10 +71,16 @@ def create_regulatory_shelf_life_plot(
             time_months,
             ci_lower_pct,
             ci_upper_pct,
-            alpha=0.2,
-            color='blue',
-            label='95% Confidence Interval'
+            alpha=0.3,
+            color='#2c7fb8',
+            label=f'{confidence_band_level*100:.0f}% Confidence Interval'
         )
+        ax.plot(time_months, ci_lower_pct, color='#075985', linestyle='--', linewidth=1.0,
+                alpha=0.9, label='_nolegend_')
+        ax.plot(time_months, ci_upper_pct, color='#075985', linestyle='--', linewidth=1.0,
+                alpha=0.9, label='_nolegend_')
+
+    ax.plot(time_months, conversion_pct, color='#173f5f', linewidth=2.2, label='Regression Mean', zorder=4)
 
     # Target threshold line
     target_pct = target_conversion * 100
@@ -98,7 +93,7 @@ def create_regulatory_shelf_life_plot(
     )
 
     # Mean shelf-life estimate
-    shelf_life_mean_months = shelf_life_mean_sec / (30.44 * 24 * 3600)
+    shelf_life_mean_months = shelf_life_mean_sec / SECONDS_PER_MONTH
     ax.axvline(
         x=shelf_life_mean_months,
         color='green',
@@ -110,7 +105,7 @@ def create_regulatory_shelf_life_plot(
 
     # Conservative shelf-life (one-sided CI)
     if shelf_life_lower_sec is not None:
-        shelf_life_lower_months = shelf_life_lower_sec / (30.44 * 24 * 3600)
+        shelf_life_lower_months = shelf_life_lower_sec / SECONDS_PER_MONTH
         ax.axvline(
             x=shelf_life_lower_months,
             color='darkgreen',
@@ -122,7 +117,7 @@ def create_regulatory_shelf_life_plot(
 
     # Study duration marker
     if study_duration_sec is not None:
-        study_duration_months = study_duration_sec / (30.44 * 24 * 3600)
+        study_duration_months = study_duration_sec / SECONDS_PER_MONTH
         ax.axvline(
             x=study_duration_months,
             color='gray',
@@ -134,14 +129,14 @@ def create_regulatory_shelf_life_plot(
 
     # ICH Q1E extrapolation ceiling
     if ich_ceiling_sec is not None:
-        ich_ceiling_months = ich_ceiling_sec / (30.44 * 24 * 3600)
+        ich_ceiling_months = ich_ceiling_sec / SECONDS_PER_MONTH
         ax.axvline(
             x=ich_ceiling_months,
             color='orange',
             linestyle=':',
             linewidth=2,
             alpha=0.8,
-            label=f'ICH Q1E Ceiling ({ich_ceiling_months:.0f} months)'
+            label=f'Extrapolation Ceiling ({ich_ceiling_months:.0f} months)'
         )
 
         # Add warning zone if shelf-life exceeds ceiling
@@ -151,7 +146,7 @@ def create_regulatory_shelf_life_plot(
                 max(time_months),
                 alpha=0.1,
                 color='orange',
-                label='Exceeds ICH Q1E Guidelines'
+                label='Exceeds configured ceiling'
             )
 
     # Labels and formatting
@@ -159,7 +154,7 @@ def create_regulatory_shelf_life_plot(
     ax.set_xlabel('Time (months)', fontsize=12, fontweight='bold')
     ax.set_ylabel('Degradation (%)', fontsize=12, fontweight='bold')
     ax.set_title(
-        f'ICH Q1E Shelf-Life Analysis\nStorage Temperature: {storage_temp_C:.0f}°C',
+        f'Shelf-Life Trend Analysis\nStorage Temperature: {storage_temp_C:.0f}°C',
         fontsize=14,
         fontweight='bold'
     )
@@ -224,7 +219,7 @@ def create_regulatory_comparison_plot(
         temp_C = temp_K - 273.15
 
         if temp_K not in temps_seen:
-            time_months = ds.time / (30.44 * 24 * 3600)
+            time_months = ds.time / SECONDS_PER_MONTH
             conversion_pct = ds.conversion * 100
 
             ax.scatter(
@@ -239,7 +234,7 @@ def create_regulatory_comparison_plot(
             temps_seen.add(temp_K)
 
     # Plot prediction at storage temperature
-    time_months = prediction.time / (30.44 * 24 * 3600)
+    time_months = prediction.time / SECONDS_PER_MONTH
     conversion_pct = prediction.conversion * 100
 
     storage_temp_C = storage_temp_K - 273.15

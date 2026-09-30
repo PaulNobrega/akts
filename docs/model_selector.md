@@ -93,7 +93,9 @@ models.modelfree.Friedman  # ['Friedman'] - Friedman differential method
 models.modelfree.all       # All model-free methods
 ```
 
-**Note**: Friedman is automatically included when data has ≥3 distinct temperatures.
+**Note**: Friedman is opt-in; add `models.modelfree.Friedman` to `models_to_try`.
+Meaningful fits require at least three distinct temperatures with overlapping
+conversion ranges.
 
 ---
 
@@ -348,8 +350,8 @@ models_to_try = ['F1', 'A2', 'R3']  # Still valid
 **Q: How do I include empirical or ODE models?**
 
 A: Add their selector lists to `models_to_try`, or use `models.all` to select
-every model category. Friedman is added automatically when the data includes at
-least three distinct temperatures.
+every model category. Friedman is not added automatically; include
+`models.modelfree.Friedman` when you want to run it.
 
 **Q: What if I mistype a model name?**
 

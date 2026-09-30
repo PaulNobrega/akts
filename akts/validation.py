@@ -8,7 +8,8 @@ from typing import List, Dict, Optional, Tuple
 import warnings
 
 from .datatypes import KineticDataset, FitResult
-from .core import fit_kinetic_model, get_log_param_names, _calculate_conversion_stats
+from .models import get_log_param_names
+from .fitting import fit_kinetic_model, _calculate_conversion_stats
 
 
 def run_leave_one_out_cv(

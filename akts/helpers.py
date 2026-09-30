@@ -7,17 +7,22 @@ import numpy as np
 import time
 import warnings
 from typing import List, Dict, Optional, Callable, Union, Tuple
+from dataclasses import replace
 from pathlib import Path
 from scipy.integrate import quad
 from scipy.interpolate import interp1d
 
 from .datatypes import KineticDataset, FitResult, BootstrapResult, IsoResult
+from .datatypes import PredictionResult
 from .loaders import load_data_file
-from .core import fit_kinetic_model, run_bootstrap, predict_conversion, rank_models, predict_conversion_model_free
+from .fitting import fit_kinetic_model
+from .bootstrap import run_bootstrap, _normalize_bootstrap_method
+from .prediction import predict_conversion, predict_conversion_model_free
+from .ranking import rank_models
 from .isoconversional import run_friedman, run_bootstrap_friedman
-from .models import get_log_param_names
+from .models import get_log_param_names, MODEL_DISPLAY_NAMES, model_display_name
 from .model_selector import models
-from .utils import construct_profile, R_GAS, calculate_aic, calculate_bic
+from .utils import construct_profile, R_GAS, calculate_aic, calculate_bic, TIME_UNITS_TO_SECONDS, SECONDS_PER_MONTH
 from .empirical import fit_empirical_global, predict_empirical
 from .json_utils import (
     parse_json_data,
@@ -30,29 +35,10 @@ from .json_utils import (
 from .reporting import generate_isothermal_report
 
 
-# Time unit conversions to seconds
-TIME_UNITS = {
-    'second': 1,
-    'seconds': 1,
-    's': 1,
-    'minute': 60,
-    'minutes': 60,
-    'min': 60,
-    'hour': 3600,
-    'hours': 3600,
-    'h': 3600,
-    'hr': 3600,
-    'day': 86400,
-    'days': 86400,
-    'd': 86400,
-    'week': 604800,
-    'weeks': 604800,
-    'month': 2592000,  # 30 days
-    'months': 2592000,
-    'year': 31536000,  # 365 days
-    'years': 31536000,
-    'yr': 31536000
-}
+# Time unit conversions to seconds. Kept as an alias for backward compatibility
+# (some callers may import TIME_UNITS directly) -- the canonical values live in
+# utils.TIME_UNITS_TO_SECONDS so every module agrees on what a "month"/"year" is.
+TIME_UNITS = TIME_UNITS_TO_SECONDS
 
 
 # Keep these aliases for compatibility; model_selector owns the model lists.
@@ -62,29 +48,7 @@ ODE_MODELS = models.ode.all
 
 EMPIRICAL_MODELS = models.empirical.all
 
-# User-friendly display names for models
-MODEL_DISPLAY_NAMES = {
-    # f(alpha) models
-    'F0': 'F0 (zero-order)',
-    'F1': 'F1 (first-order)',
-    'F2': 'F2 (second-order)',
-    'F3': 'F3 (third-order)',
-    'A2': 'A2 (Avrami-Erofeev, n=2)',
-    'A3': 'A3 (Avrami-Erofeev, n=3)',
-    'R2': 'R2 (contracting area)',
-    'R3': 'R3 (contracting volume)',
-    'D2': 'D2 (2D diffusion)',
-    'D3': 'D3 (3D diffusion, Jander)',
-    'D4': 'D4 (3D diffusion, Ginstling-Brounshtein)',
-    'D1': 'D1 (1D diffusion)',
-    'SB_mn': 'SB(m,n) (Sestak-Berggren, autocatalytic)',
-    'Bna': 'Bna (Prout-Tompkins, autocatalytic)',
-    # ODE models (multi-step)
-    'A->B->C': 'A->B->C (consecutive reactions)',
-    'A+B->C': 'A+B->C (bimolecular)',
-    # Model-free (isoconversional)
-    'Friedman': 'Friedman (model-free isoconversional)',
-}
+# Re-exported for compatibility; models.MODEL_DISPLAY_NAMES is the single source.
 
 
 LOADER_TIME_UNITS_TO_SECONDS = {'s': 1, 'min': 60, 'h': 3600, 'days': 86400, 'weeks': 604800}
@@ -150,6 +114,58 @@ def _temperature_to_kelvin(temp: float, unit: str) -> float:
         return (temp - 32) * 5/9 + 273.15
     else:
         raise ValueError(f"Unknown temperature unit: {unit}. Supported: 'K', 'C', 'F'")
+
+
+def _predict_empirical_with_ci(
+    fit_result: FitResult,
+    time_points: np.ndarray,
+    temperature_K: float,
+    bootstrap_result: Optional[BootstrapResult],
+) -> PredictionResult:
+    """Predict an empirical curve and propagate bootstrap parameter uncertainty."""
+    time_points = np.asarray(time_points, dtype=float)
+    conversion = predict_empirical(fit_result, time_points, temperature_K)
+    conversion_ci = None
+
+    if (bootstrap_result is not None
+            and bootstrap_result.model_name == fit_result.model_name
+            and bootstrap_result.n_iterations > 0):
+        distributions = bootstrap_result.parameter_distributions
+        parameter_names = list(fit_result.parameters)
+        if parameter_names and all(name in distributions for name in parameter_names):
+            n_replicates = min(
+                bootstrap_result.n_iterations,
+                *(len(distributions[name]) for name in parameter_names),
+            )
+            replicate_curves = np.full((n_replicates, len(time_points)), np.nan)
+            for index in range(n_replicates):
+                parameters = {name: float(distributions[name][index]) for name in parameter_names}
+                if not all(np.isfinite(value) for value in parameters.values()):
+                    continue
+                try:
+                    replicate_fit = replace(fit_result, parameters=parameters)
+                    replicate_curves[index] = predict_empirical(
+                        replicate_fit, time_points, temperature_K
+                    )
+                except (KeyError, ValueError, FloatingPointError):
+                    continue
+
+            valid_curves = np.any(np.isfinite(replicate_curves), axis=1)
+            if np.any(valid_curves):
+                tail = (1.0 - bootstrap_result.confidence_level) / 2.0
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', category=RuntimeWarning)
+                    conversion_ci = (
+                        np.nanpercentile(replicate_curves[valid_curves], tail * 100.0, axis=0),
+                        np.nanpercentile(replicate_curves[valid_curves], (1.0 - tail) * 100.0, axis=0),
+                    )
+
+    return PredictionResult(
+        time=time_points,
+        temperature=np.full_like(time_points, temperature_K),
+        conversion=np.asarray(conversion, dtype=float),
+        conversion_ci=conversion_ci,
+    )
 
 
 def _temperature_from_kelvin(temp: float, unit: str) -> float:
@@ -219,7 +235,8 @@ def _fit_with_stability_check(
     initial_guesses: Dict,
     bounds: Dict,
     use_multistart: bool,
-    progress: Callable
+    progress: Callable,
+    random_state: Optional[int] = None
 ) -> FitResult:
     """
     Fit a model with extra stability checks for problematic models like A+B->C.
@@ -258,7 +275,8 @@ def _fit_with_stability_check(
                     model_definition_args=model_info['def_args'],
                     initial_guesses=initial_guesses,
                     parameter_bounds=bounds,
-                    progress_callback=progress
+                    progress_callback=progress,
+                    random_state=random_state
                 )
             else:
                 fit_res = fit_kinetic_model(
@@ -370,7 +388,8 @@ def _multistart_fit(
     initial_guesses: Dict[str, float],
     parameter_bounds: Dict[str, Tuple[float, float]],
     n_starts: int = 4,
-    progress_callback: Optional[Callable] = None
+    progress_callback: Optional[Callable] = None,
+    random_state: Optional[Union[int, np.random.Generator]] = None
 ) -> FitResult:
     """
     Fit an ODE model from several starting points and keep the best result.
@@ -398,6 +417,8 @@ def _multistart_fit(
         Number of fitting attempts: 1 unperturbed + (n_starts - 1) perturbed.
     progress_callback : Callable, optional
         Progress callback function.
+    random_state : int or np.random.Generator, optional
+        Seed for the perturbed starting points (reproducible multistart).
 
     Returns
     -------
@@ -410,7 +431,7 @@ def _multistart_fit(
     except ValueError:
         log_param_names = frozenset()
 
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(random_state)
     best_result: Optional[FitResult] = None
     last_message = "all starts failed"
 
@@ -700,6 +721,199 @@ def calculate_ich_q1e_ceiling(
         return 1.5 * study_duration_months
 
 
+def _calculate_shelf_life_trend(
+    datasets: List[KineticDataset],
+    storage_temp_K: float,
+    target_conversion: float = 0.05,
+    confidence_level: float = 0.95,
+    temperature_tolerance_K: float = 0.5,
+    nonlinearity_p_threshold: float = 0.05,
+) -> Optional[Dict]:
+    """Select linear/quadratic same-temperature trends and estimate target crossing."""
+    from scipy.optimize import brentq
+    from scipy.stats import f as f_distribution, t as t_distribution
+
+    if not 0.0 < target_conversion <= 1.0:
+        raise ValueError("target_conversion must be in (0, 1].")
+    if not 0.0 < confidence_level < 1.0:
+        raise ValueError("confidence_level must be in (0, 1).")
+    if not 0.0 < nonlinearity_p_threshold < 1.0:
+        raise ValueError("nonlinearity_p_threshold must be in (0, 1).")
+
+    batch_data = []
+    for dataset in datasets:
+        if abs(float(np.mean(dataset.temperature)) - storage_temp_K) > temperature_tolerance_K:
+            continue
+        time_days = np.asarray(dataset.time, dtype=float) / 86400.0
+        conversion = np.asarray(dataset.conversion, dtype=float)
+        valid = np.isfinite(time_days) & np.isfinite(conversion)
+        x_days, values = time_days[valid], conversion[valid]
+        if len(x_days) < 3 or np.ptp(x_days) == 0:
+            continue
+        x_center = float(np.mean(x_days))
+        x_centered = x_days - x_center
+        linear_design = np.column_stack((np.ones(len(x_days)), x_centered))
+        linear_coefficients = np.linalg.lstsq(linear_design, values, rcond=None)[0]
+        linear_residuals = values - linear_design @ linear_coefficients
+        linear_sse = float(np.dot(linear_residuals, linear_residuals))
+
+        quadratic_design = np.column_stack((np.ones(len(x_days)), x_centered, x_centered ** 2))
+        quadratic_coefficients = None
+        quadratic_sse = None
+        curvature_p_value = None
+        if len(x_days) >= 4 and np.linalg.matrix_rank(quadratic_design) == 3:
+            quadratic_coefficients = np.linalg.lstsq(quadratic_design, values, rcond=None)[0]
+            quadratic_residuals = values - quadratic_design @ quadratic_coefficients
+            quadratic_sse = float(np.dot(quadratic_residuals, quadratic_residuals))
+            improvement = max(0.0, linear_sse - quadratic_sse)
+            residual_df = len(x_days) - 3
+            if quadratic_sse <= np.finfo(float).eps * max(1.0, linear_sse):
+                curvature_p_value = 0.0 if improvement > np.finfo(float).eps else 1.0
+            else:
+                curvature_f = improvement / (quadratic_sse / residual_df)
+                curvature_p_value = float(f_distribution.sf(curvature_f, 1, residual_df))
+
+        trend_type = (
+            'quadratic'
+            if curvature_p_value is not None and curvature_p_value < nonlinearity_p_threshold
+            else 'linear'
+        )
+        design_matrix = quadratic_design if trend_type == 'quadratic' else linear_design
+        coefficients = quadratic_coefficients if trend_type == 'quadratic' else linear_coefficients
+        residuals = values - design_matrix @ coefficients
+        residual_df = len(x_days) - design_matrix.shape[1]
+        mse = float(np.dot(residuals, residuals) / residual_df)
+        covariance = mse * np.linalg.pinv(design_matrix.T @ design_matrix)
+        batch_data.append({
+            'x_days': x_days, 'values': values, 'n': len(x_days), 'x_center': x_center,
+            'sxx': float(np.dot(x_centered, x_centered)),
+            'linear_slope': float(linear_coefficients[1]), 'linear_sse': linear_sse,
+            'trend_type': trend_type, 'curvature_p_value': curvature_p_value,
+            'coefficients': coefficients, 'covariance': covariance,
+            'residual_df': residual_df, 'mse': mse,
+        })
+
+    if not batch_data:
+        return None
+
+    n_batches = len(batch_data)
+    total_n = sum(batch['n'] for batch in batch_data)
+    slope_p_value = None
+    pooled_slopes = False
+    all_linear = all(batch['trend_type'] == 'linear' for batch in batch_data)
+    if n_batches > 1 and all_linear and total_n > 2 * n_batches:
+        total_sxx = sum(batch['sxx'] for batch in batch_data)
+        common_slope = sum(
+            float(np.dot(
+                batch['x_days'] - batch['x_center'],
+                batch['values'] - np.mean(batch['values']),
+            ))
+            for batch in batch_data
+        ) / total_sxx
+        pooled_sse = 0.0
+        for batch in batch_data:
+            intercept = float(np.mean(batch['values']))
+            residuals = batch['values'] - (intercept + common_slope * (batch['x_days'] - batch['x_center']))
+            pooled_sse += float(np.dot(residuals, residuals))
+        separate_sse = sum(batch['linear_sse'] for batch in batch_data)
+        df_num, df_den = n_batches - 1, total_n - 2 * n_batches
+        if pooled_sse > 0 and separate_sse < pooled_sse:
+            f_stat = max(0.0, (pooled_sse - separate_sse) / df_num) / (separate_sse / df_den)
+            slope_p_value = float(f_distribution.sf(f_stat, df_num, df_den))
+        else:
+            slope_p_value = 1.0
+        pooled_slopes = slope_p_value > 0.25
+
+    if pooled_slopes:
+        residual_variance = pooled_sse / (total_n - n_batches - 1)
+        slope_sxx = sum(batch['sxx'] for batch in batch_data)
+        regression_groups = []
+        for batch in batch_data:
+            coefficients = np.array([float(np.mean(batch['values'])), common_slope])
+            covariance = np.diag([residual_variance / batch['n'], residual_variance / slope_sxx])
+            regression_groups.append({
+                **batch, 'coefficients': coefficients, 'covariance': covariance,
+                'mse': residual_variance, 'residual_df': total_n - n_batches - 1,
+            })
+        regression_method = 'ANCOVA with common slope'
+    else:
+        regression_groups = batch_data
+        if n_batches == 1:
+            regression_method = f"{batch_data[0]['trend_type']} regression"
+        elif all_linear:
+            regression_method = 'separate batch linear regressions'
+        else:
+            selected_trends = {batch['trend_type'] for batch in batch_data}
+            trend_label = '/'.join(sorted(selected_trends))
+            regression_method = f'separate batch {trend_label} regressions'
+
+    def trend_statistics(terms, day_values):
+        centered_days = np.asarray(day_values, dtype=float) - terms['x_center']
+        if terms['trend_type'] == 'quadratic':
+            design = np.column_stack((np.ones_like(centered_days), centered_days, centered_days ** 2))
+        else:
+            design = np.column_stack((np.ones_like(centered_days), centered_days))
+        mean_values = design @ terms['coefficients']
+        variance = np.einsum('ij,jk,ik->i', design, terms['covariance'], design)
+        return mean_values, np.sqrt(np.maximum(variance, 0.0))
+
+    def first_crossing(terms, upper_limit):
+        def difference(day):
+            mean_value, standard_error = trend_statistics(terms, np.asarray([day]))
+            limit = mean_value[0]
+            if upper_limit:
+                limit += t_distribution.ppf(confidence_level, terms['residual_df']) * standard_error[0]
+            return limit - target_conversion
+
+        if difference(0.0) >= 0:
+            return 0.0
+        high = max(float(np.max(terms['x_days'])), 1.0)
+        for _ in range(40):
+            grid = np.linspace(0.0, high, 512)
+            differences = np.array([difference(day) for day in grid])
+            crossings = np.flatnonzero(differences >= 0)
+            if crossings.size:
+                crossing_index = int(crossings[0])
+                if crossing_index == 0:
+                    return 0.0
+                return float(brentq(difference, grid[crossing_index - 1], grid[crossing_index]))
+            high *= 2.0
+        return None
+
+    estimates = []
+    for terms in regression_groups:
+        mean_days = first_crossing(terms, upper_limit=False)
+        lower_days = first_crossing(terms, upper_limit=True)
+        if mean_days is None or lower_days is None:
+            continue
+        estimates.append({
+            'mean_days': float(mean_days), 'lower_days': float(lower_days),
+            'terms': terms,
+        })
+
+    if not estimates:
+        return None
+    limiting = min(estimates, key=lambda estimate: estimate['lower_days'])
+    trend_types = {batch['trend_type'] for batch in batch_data}
+    trend_type = next(iter(trend_types)) if len(trend_types) == 1 else 'mixed'
+    curvature_p_values = [batch['curvature_p_value'] for batch in batch_data
+                          if batch['curvature_p_value'] is not None]
+    study_duration_days = max(float(np.max(batch['x_days'])) for batch in batch_data)
+    return {
+        'shelf_life_days': min(item['mean_days'] for item in estimates),
+        'shelf_life_lower_95_days': limiting['lower_days'],
+        'study_duration_days': study_duration_days,
+        'n_batches': n_batches,
+        'regression_method': regression_method,
+        'trend_type': trend_type,
+        'nonlinearity_p_threshold': nonlinearity_p_threshold,
+        'curvature_p_value': min(curvature_p_values) if curvature_p_values else None,
+        'slope_p_value': slope_p_value,
+        'poolability_alpha': 0.25,
+        'prediction_terms': limiting['terms'],
+    }
+
+
 def time_to_conversion(
     fit_result: FitResult,
     target_conversion: float,
@@ -715,7 +929,8 @@ def time_to_conversion(
 
     This is the inverse of predict_conversion(): instead of "what's the conversion
     at time t", it answers "at what time does conversion first reach alpha_target".
-    Used for shelf-life-style questions (ICH Q1E "time to reach 5% degradation").
+    Useful for model-based extrapolation questions such as time to a target
+    conversion. This utility is not the ICH Q1E linear-regression calculation.
 
     Parameters
     ----------
@@ -739,9 +954,9 @@ def time_to_conversion(
         crossing time at the cost of more ODE evaluations.
     one_sided_ci : bool, default=False
         If True, compute one-sided 95% lower bound (5th percentile) instead of
-        two-sided 95% CI (2.5th-97.5th percentiles). Use True for ICH Q1E
-        regulatory shelf-life estimates (more conservative). When True,
-        time_upper_sec will be None.
+        two-sided 95% CI (2.5th-97.5th percentiles) from bootstrap crossing times.
+        This is a model-based uncertainty option, not an ICH Q1E calculation.
+        When True, time_upper_sec will be None.
 
     Returns
     -------
@@ -1027,11 +1242,15 @@ def _wrap_friedman_as_fit_result(iso_result: IsoResult, datasets: List[KineticDa
     both read it back out via model_name == "Friedman".
     """
     n_params = int(np.isfinite(iso_result.Ea).sum())
-    if n_params < 2:
+    # Each alpha level's Ea comes from a regression of ln(rate) on 1/T across
+    # datasets. With only 2 temperatures that line has 0 degrees of freedom -- it
+    # passes exactly through both points whatever the kinetics -- so require 3.
+    n_temps = len({round(float(np.mean(ds.temperature)), 1) for ds in datasets if len(ds.temperature)})
+    if n_params < 2 or n_temps < 3:
         return FitResult(
             model_name='Friedman', parameters={}, success=False,
-            message="Friedman analysis resolved fewer than 2 alpha levels -- "
-                    "need at least 2 datasets at different temperatures/rates.",
+            message="Friedman analysis needs at least 3 datasets at different temperatures "
+                    f"(got {n_temps}) and at least 2 resolved alpha levels (got {n_params}).",
             rss=np.inf, n_datapoints=0, n_parameters=n_params,
         )
 
@@ -1074,6 +1293,27 @@ def _wrap_friedman_as_fit_result(iso_result: IsoResult, datasets: List[KineticDa
     )
 
 
+def _bootstrap_results_by_display_name(
+    bootstrap_results: Dict[str, BootstrapResult],
+    fit_result_names: Dict[str, FitResult],
+) -> Optional[Dict[str, BootstrapResult]]:
+    """Keys bootstrap results the way the rest of the result dict names models.
+
+    Internally bootstraps are stored under FitResult.model_name ('single_step',
+    'Friedman', ...), but 'selected_model', 'top_models' and 'fit_results' use
+    the configured names ('F1_model', 'Friedman_model', ...). Expose both, so
+    ``results['bootstrap_results'][results['selected_model']['model_name']]``
+    works and the old internal-name keys keep working.
+    """
+    if not bootstrap_results:
+        return None
+    out = dict(bootstrap_results)
+    for custom_name, fit in fit_result_names.items():
+        if fit.model_name in bootstrap_results:
+            out.setdefault(custom_name, bootstrap_results[fit.model_name])
+    return out
+
+
 def _select_simplest_equivalent(ranked_models: List[Dict]) -> Tuple[Dict, str]:
     """Among models whose BIC is within INDISTINGUISHABLE_DELTA_BIC of the best, pick the simplest."""
     best_bic = min(m['stats']['bic'] for m in ranked_models)
@@ -1109,6 +1349,13 @@ def auto_model_isothermal_data(
     auto_open: bool = False,
     progress_callback: Optional[Callable[[str, Dict], None]] = None,
     n_jobs: int = -1,
+    random_state: Optional[int] = None,
+    bootstrap_method: str = 'monte_carlo',
+    shelf_life_temperature_C: float = 20.0,
+    shelf_life_target_conversion: float = 0.05,
+    shelf_life_confidence_level: float = 0.95,
+    shelf_life_is_long_term: bool = True,
+    shelf_life_nonlinearity_p_threshold: float = 0.05,
     **loader_kwargs
 ) -> Union[Dict, str, Tuple[Dict, str]]:
     """
@@ -1161,18 +1408,14 @@ def auto_model_isothermal_data(
         - models.ode.all (multi-step ODE models)
         - models.all (everything)
         ODE and empirical models are auto-detected from the list.
-        Default: F0, F1, F2, F3, A2, A3, R2, R3, D2, D3, SB_mn, Bna
-        Plus 'Friedman' if data has >=3 distinct temperatures (auto-added).
+        Default: F0, F1, F2, F3, A2, A3, R2, R3, D2, D3, SB_mn, Bna.
+        Add 'Friedman' explicitly to include isoconversional analysis.
     include_ode_models : bool, default=False
         **DEPRECATED**: Use model selector instead (models.ode.all).
         Kept for backward compatibility. When models_to_try=None, adds ODE models
         to default list. ODE models (A->B->C, A+B->C) are slower (~5-10x) but
         more flexible. With model selector, ODE models are auto-enabled when present.
-        Friedman model-free analysis ('Friedman') has no such flag -- it is added
-        to the default list automatically whenever the loaded data spans >=3
-        distinct temperatures (rounded to the nearest Kelvin), since that's the
-        minimum needed for a meaningful per-alpha regression; with 1-2
-        temperatures it's silently omitted rather than included and failing.
+        Friedman is model-free and must be explicitly included in models_to_try.
     include_empirical_models : bool, default=False
         **DEPRECATED**: Use model selector instead (models.empirical.all).
         Kept for backward compatibility. When models_to_try=None, adds empirical
@@ -1186,6 +1429,21 @@ def auto_model_isothermal_data(
         starting ratio of the two reactants is known and not 1:1.
     bootstrap_iterations : int, default=100
         Number of bootstrap iterations for confidence intervals
+    bootstrap_method : {'monte_carlo', 'parametric', 'residual'}, default='monte_carlo'
+        Bootstrap sampling strategy. 'monte_carlo' resamples complete observations
+        within each dataset; 'parametric' adds Gaussian noise estimated from fit
+        residuals; 'residual' resamples centered residuals with transition weighting.
+    shelf_life_temperature_C : float, default=20.0
+        Storage temperature used by the separate regression-based shelf-life analysis.
+    shelf_life_target_conversion : float, default=0.05
+        Conversion specification limit for shelf-life estimation, in (0, 1].
+    shelf_life_confidence_level : float, default=0.95
+        One-sided confidence level used for the adverse-direction shelf-life bound.
+    shelf_life_is_long_term : bool, default=True
+        Select the long-term or accelerated ICH extrapolation-ceiling formula.
+    shelf_life_nonlinearity_p_threshold : float, default=0.05
+        Select a quadratic trend when its nested F-test against a linear trend has
+        a p-value below this threshold.
     confidence_level : float, default=0.95
         Confidence level for intervals (0.95 = 95%)
     filter_implausible : bool, default=False
@@ -1207,6 +1465,10 @@ def auto_model_isothermal_data(
         Number of worker processes for bootstrap fitting. The default uses all
         but one available CPU core; the worker count is capped at the number of
         bootstrap iterations. Set to 1 to use a single worker process.
+    random_state : int, optional
+        Seed for every random step (multistart starting points and bootstrap
+        resampling). Set it to make repeated runs on the same data give
+        identical results; None (default) draws fresh randomness each run.
     **loader_kwargs
         Additional keyword arguments passed to load_data_file()
 
@@ -1248,6 +1510,14 @@ def auto_model_isothermal_data(
     >>> import json
     >>> data = json.loads(results)
     """
+    bootstrap_method = _normalize_bootstrap_method(bootstrap_method)
+    if not 0.0 < shelf_life_target_conversion <= 1.0:
+        raise ValueError("shelf_life_target_conversion must be in (0, 1].")
+    if not 0.0 < shelf_life_confidence_level < 1.0:
+        raise ValueError("shelf_life_confidence_level must be in (0, 1).")
+    if not 0.0 < shelf_life_nonlinearity_p_threshold < 1.0:
+        raise ValueError("shelf_life_nonlinearity_p_threshold must be in (0, 1).")
+
     # Initialize progress callback
     progress = _create_progress_wrapper(progress_callback)
 
@@ -1317,13 +1587,6 @@ def auto_model_isothermal_data(
         if has_empirical:
             progress("Empirical models detected in selection (global Arrhenius fitting)...", {})
 
-    # Friedman auto-add when >=3 temperatures available
-    # (Always auto-detect rather than requiring opt-in flag)
-    n_distinct_temps = len({round(float(ds.temperature.mean())) for ds in datasets})
-    if n_distinct_temps >= 3 and 'Friedman' not in models_to_try:
-        models_to_try.append('Friedman')
-        progress(f"Including Friedman model-free analysis ({n_distinct_temps} distinct temperatures detected)...", {})
-
     # Get smart initial guesses if ODE models are included
     smart_guess = None
     has_ode = any('->' in m or '+' in m for m in models_to_try)
@@ -1345,8 +1608,7 @@ def auto_model_isothermal_data(
     for model_info in models_config:
         custom_name = model_info['name']
         # Get display name (e.g., "F1 (first-order)" instead of "F1_model")
-        base_model = custom_name.replace('_model', '')
-        display_name = MODEL_DISPLAY_NAMES.get(base_model, base_model)
+        display_name = model_display_name(custom_name)
 
         progress(f"Fitting {display_name}...", {'model': custom_name})
 
@@ -1387,8 +1649,15 @@ def auto_model_isothermal_data(
                 # requested alpha still has real data around it to regress on).
                 max_reachable = min(ds.conversion.max() for ds in datasets if len(ds.conversion) > 0)
                 alpha_hi = min(0.95, max_reachable * 0.9)
-                alpha_lo = min(0.05, alpha_hi)  # keep the low end below alpha_hi even in a narrow-range case
-                friedman_alpha_levels = np.linspace(alpha_lo, alpha_hi, 19)
+                # Log-spaced from 0.5% conversion: shelf-life questions (time to a few %
+                # degradation) depend almost entirely on Ea(alpha) and ln[A f(alpha)]
+                # at low alpha, and predictions hold the lowest level's values constant
+                # below it. Starting at 5% with linear spacing left the early part of
+                # the curve unresolved (predicted time to 5% was half the observed time
+                # on the bundled protein data). Levels no dataset resolves stay NaN and
+                # are skipped.
+                alpha_lo = min(0.005, alpha_hi / 2)
+                friedman_alpha_levels = np.geomspace(alpha_lo, alpha_hi, 25)
                 iso_result = run_friedman(datasets, alpha_levels=friedman_alpha_levels)
                 fit_res = _wrap_friedman_as_fit_result(iso_result, datasets)
             except Exception as e:
@@ -1405,7 +1674,8 @@ def auto_model_isothermal_data(
                 initial_guesses=initial_guesses[custom_name].copy(),
                 bounds=bounds.get(custom_name).copy(),
                 use_multistart=use_multistart,
-                progress=progress
+                progress=progress,
+                random_state=random_state
             )
         elif use_multistart:
             progress(f"  Using multistart local fitting (faster for ODE models)...", {})
@@ -1416,7 +1686,8 @@ def auto_model_isothermal_data(
                     model_definition_args=model_info['def_args'],
                     initial_guesses=initial_guesses[custom_name],
                     parameter_bounds=bounds.get(custom_name),
-                    progress_callback=progress
+                    progress_callback=progress,
+                    random_state=random_state
                 )
             except Exception as e:
                 progress(f"  Multistart fit failed: {e}. Falling back to traditional...", {})
@@ -1515,6 +1786,7 @@ def auto_model_isothermal_data(
                 bootstrap_result = run_bootstrap_friedman(
                     datasets=datasets, iso_result=iso_result,
                     n_iterations=bootstrap_iterations, confidence_level=confidence_level,
+                    random_state=random_state, bootstrap_method=bootstrap_method,
                 )
             else:
                 bootstrap_result = run_bootstrap(
@@ -1524,7 +1796,9 @@ def auto_model_isothermal_data(
                     parameter_bounds=bounds.get(top_custom_name),
                     n_iterations=bootstrap_iterations,
                     confidence_level=confidence_level,
-                    n_jobs=n_jobs
+                    n_jobs=n_jobs,
+                    random_state=random_state,
+                    bootstrap_method=bootstrap_method,
                 )
             if bootstrap_result:
                 bootstrap_results[top_fit.model_name] = bootstrap_result
@@ -1563,19 +1837,10 @@ def auto_model_isothermal_data(
         try:
             # Check if it's an empirical model
             if top_fit_results[0].model_name.startswith('Empirical_'):
-                # Use empirical prediction (no bootstrap support yet)
-                conversion_mean = predict_empirical(
-                    fit_result=top_fit_results[0],
-                    time_points=time_eval,
-                    temperature_K=temp_K
-                )
-                # Create PredictionResult manually
-                from akts.datatypes import PredictionResult
-                pred_result = PredictionResult(
-                    time=time_eval,
-                    conversion=conversion_mean,
-                    conversion_ci=None,  # No CI for empirical models yet
-                    temperature=np.full_like(time_eval, temp_K)
+                pred_result = _predict_empirical_with_ci(
+                    fit_result=top_fit_results[0], time_points=time_eval,
+                    temperature_K=temp_K,
+                    bootstrap_result=bootstrap_results.get(top_fit_results[0].model_name),
                 )
             else:
                 # Use mechanistic prediction
@@ -1613,94 +1878,94 @@ def auto_model_isothermal_data(
         except Exception as e:
             warnings.warn(f"Prediction failed: {e}")
 
-    # Step 6b: Calculate ICH Q1E regulatory outputs (always include when predictions are made)
+    # Step 6b: Calculate regression-based shelf-life output when prediction is requested.
     regulatory_results = None
     if predictions_dict is not None and top_fit_results:
         try:
-            progress("Calculating ICH Q1E regulatory analysis...", {'step': '6b'})
+            progress("Calculating shelf-life trend analysis...", {'step': '6b'})
 
-            # Determine study duration from datasets (max time observed)
-            max_time_sec = max(ds.time.max() for ds in datasets)
-            study_duration_months = max_time_sec / (30.44 * 24 * 3600)  # 30.44 days/month average
-
-            # ICH Q1E requires confidence intervals - run bootstrap if not already done
-            bootstrap_result_selected = bootstrap_results.get(top_fit_results[0].model_name) if bootstrap_results else None
-
-            if not bootstrap_result_selected:
-                # Run bootstrap specifically for regulatory compliance
-                progress("Running bootstrap for ICH Q1E regulatory compliance...", {'step': '6b-bootstrap'})
-                top_fit = top_fit_results[0]
-                top_custom_name = next(n for n, r in fit_result_names.items() if r is top_fit)
-
-                try:
-                    if top_fit.model_name == "Friedman":
-                        iso_result = top_fit.model_definition_args['iso_result']
-                        bootstrap_result_selected = run_bootstrap_friedman(
-                            datasets=datasets, iso_result=iso_result,
-                            n_iterations=50,  # Minimum for regulatory
-                            confidence_level=confidence_level,
-                        )
-                    else:
-                        bootstrap_result_selected = run_bootstrap(
-                            datasets=datasets,
-                            fit_result=top_fit,
-                            optimizer_options={'method': 'Powell'},
-                            parameter_bounds=bounds.get(top_custom_name),
-                            n_iterations=50,  # Minimum for regulatory
-                            confidence_level=confidence_level,
-                            n_jobs=n_jobs
-                        )
-                    if bootstrap_result_selected:
-                        bootstrap_results[top_fit.model_name] = bootstrap_result_selected
-                        progress(f"Bootstrap complete for regulatory analysis",
-                                {'iterations': bootstrap_result_selected.n_iterations})
-                except Exception as e:
-                    warnings.warn(f"Bootstrap for regulatory analysis failed: {e}. Regulatory section will be omitted.")
-                    bootstrap_result_selected = None
-
-            # Calculate shelf-life with one-sided CI at 5% degradation (standard threshold)
-            # Use same temperature as predictions
-            if bootstrap_result_selected:
-                shelf_life_result = time_to_conversion(
-                    fit_result=top_fit_results[0],
-                    target_conversion=0.05,  # Standard pharmaceutical threshold (5% degradation)
-                    temperature_K=temp_K,
-                    bootstrap_result=bootstrap_result_selected,
-                    one_sided_ci=True  # ICH Q1E mode (conservative estimate)
+            # Shelf-life trend analysis is independent of the kinetic bootstrap.
+            q1e_result = _calculate_shelf_life_trend(
+                datasets,
+                storage_temp_K=float(_temperature_to_kelvin(shelf_life_temperature_C, 'C')),
+                target_conversion=shelf_life_target_conversion,
+                confidence_level=shelf_life_confidence_level,
+                nonlinearity_p_threshold=shelf_life_nonlinearity_p_threshold,
+            )
+            if q1e_result is None:
+                progress(
+                    "Shelf-life estimate unavailable: no usable study data at the configured shelf-life temperature.",
+                    {'storage_temp_K': float(_temperature_to_kelvin(shelf_life_temperature_C, 'C'))},
                 )
+            else:
+                study_duration_months = q1e_result['study_duration_days'] * 86400.0 / SECONDS_PER_MONTH
+                ich_ceiling = float(calculate_ich_q1e_ceiling(
+                    study_duration_months, is_long_term=shelf_life_is_long_term
+                ))
+                terms = q1e_result['prediction_terms']
+                plot_end_days = max(
+                    q1e_result['study_duration_days'],
+                    q1e_result['shelf_life_days'],
+                    ich_ceiling * SECONDS_PER_MONTH / 86400.0,
+                )
+                plot_days = np.linspace(0.0, plot_end_days, 200)
+                centered_days = plot_days - terms['x_center']
+                if terms['trend_type'] == 'quadratic':
+                    prediction_design = np.column_stack((
+                        np.ones_like(centered_days), centered_days, centered_days ** 2
+                    ))
+                else:
+                    prediction_design = np.column_stack((np.ones_like(centered_days), centered_days))
+                conversion_mean = prediction_design @ terms['coefficients']
+                prediction_variance = np.einsum(
+                    'ij,jk,ik->i', prediction_design, terms['covariance'], prediction_design
+                )
+                standard_error = np.sqrt(np.maximum(prediction_variance, 0.0))
+                band_level = 2.0 * shelf_life_confidence_level - 1.0
+                from scipy.stats import t as t_distribution
+                band_t = t_distribution.ppf((1.0 + band_level) / 2.0, terms['residual_df'])
+                prediction_result = PredictionResult(
+                    time=plot_days * 86400.0,
+                    temperature=np.full_like(plot_days, temp_K),
+                    conversion=np.clip(conversion_mean, 0.0, 1.0),
+                    conversion_ci=(
+                        np.clip(conversion_mean - band_t * standard_error, 0.0, 1.0),
+                        np.clip(conversion_mean + band_t * standard_error, 0.0, 1.0),
+                    ),
+                )
+                shelf_life_months = q1e_result['shelf_life_days'] * 86400.0 / SECONDS_PER_MONTH
+                shelf_life_lower_months = q1e_result['shelf_life_lower_95_days'] * 86400.0 / SECONDS_PER_MONTH
+                regulatory_results = {
+                    'shelf_life_months': shelf_life_months,
+                    'shelf_life_lower_95': shelf_life_lower_months,
+                    'shelf_life_lower_confidence': shelf_life_lower_months,
+                    'target_conversion': shelf_life_target_conversion,
+                    'storage_temp_K': float(_temperature_to_kelvin(shelf_life_temperature_C, 'C')),
+                    'study_duration_months': study_duration_months,
+                    'ich_ceiling_months': ich_ceiling,
+                    'exceeds_guideline': shelf_life_lower_months > ich_ceiling,
+                    'regression_method': q1e_result['regression_method'],
+                    'trend_type': q1e_result['trend_type'],
+                    'curvature_p_value': q1e_result['curvature_p_value'],
+                    'nonlinearity_p_threshold': shelf_life_nonlinearity_p_threshold,
+                    'ancova_slope_p_value': q1e_result['slope_p_value'],
+                    'poolability_alpha': 0.25,
+                    'shelf_life_confidence_level': shelf_life_confidence_level,
+                    'shelf_life_is_long_term': shelf_life_is_long_term,
+                    'prediction_band_level': band_level,
+                    'prediction': prediction_result,
+                }
 
-                if shelf_life_result['time_sec'] is not None:
-                    # Convert to months
-                    shelf_life_months = shelf_life_result['time_sec'] / (30.44 * 24 * 3600)
-                    shelf_life_lower_months = (
-                        shelf_life_result['time_lower_sec'] / (30.44 * 24 * 3600)
-                        if shelf_life_result['time_lower_sec'] is not None else None
-                    )
-
-                    # Calculate ICH Q1E extrapolation ceiling
-                    ich_ceiling = calculate_ich_q1e_ceiling(study_duration_months, is_long_term=True)
-
-                    regulatory_results = {
-                        'shelf_life_months': shelf_life_months,
-                        'shelf_life_lower_95': shelf_life_lower_months,
-                        'target_conversion': 0.05,
-                        'storage_temp_K': temp_K,
-                        'study_duration_months': study_duration_months,
-                        'ich_ceiling_months': ich_ceiling,
-                        'exceeds_guideline': (
-                            shelf_life_lower_months > ich_ceiling
-                            if shelf_life_lower_months is not None else False
-                        ),
-                        'prediction': prediction_result  # PredictionResult object for regulatory plots
-                    }
-
-                    # Convert temperature for progress message
-                    temp_progress = _temperature_from_kelvin(temp_K, output_temperature_units)
-                    progress(
-                        f"ICH Q1E shelf-life: {shelf_life_lower_months:.1f} months "
-                        f"(95% lower bound at 5% degradation, {temp_progress:.1f} {output_temperature_units})",
-                        {'shelf_life_months': shelf_life_lower_months, 'ich_ceiling_months': ich_ceiling}
-                    )
+                temp_progress = _temperature_from_kelvin(
+                    _temperature_to_kelvin(shelf_life_temperature_C, 'C'), output_temperature_units
+                )
+                progress(
+                    f"Shelf-life regression estimate ({q1e_result['trend_type']} trend): "
+                    f"{shelf_life_lower_months:.1f} months "
+                    f"(one-sided {shelf_life_confidence_level:.0%} confidence limit at "
+                    f"{shelf_life_target_conversion:.1%} conversion, {temp_progress:.1f} {output_temperature_units})",
+                    {'shelf_life_months': shelf_life_lower_months, 'ich_ceiling_months': ich_ceiling},
+                )
         except Exception as e:
             warnings.warn(f"ICH Q1E regulatory calculation failed: {e}")
 
@@ -1743,17 +2008,10 @@ def auto_model_isothermal_data(
                 # Empirical models don't support variable temperature simulation yet
                 # Use average temperature as approximation
                 avg_temp_K = np.mean(sim_temps_K)
-                conversion_mean = predict_empirical(
-                    fit_result=top_fit_results[0],
-                    time_points=time_eval,
-                    temperature_K=avg_temp_K
-                )
-                from akts.datatypes import PredictionResult
-                sim_result = PredictionResult(
-                    time=time_eval,
-                    conversion=conversion_mean,
-                    conversion_ci=None,
-                    temperature=np.full_like(time_eval, avg_temp_K)
+                sim_result = _predict_empirical_with_ci(
+                    fit_result=top_fit_results[0], time_points=time_eval,
+                    temperature_K=avg_temp_K,
+                    bootstrap_result=bootstrap_results.get(top_fit_results[0].model_name),
                 )
                 progress("  Note: Empirical model simulation uses average temperature (variable temp not supported)", {})
             else:
@@ -1793,24 +2051,38 @@ def auto_model_isothermal_data(
         except Exception as e:
             warnings.warn(f"Temperature excursion simulation failed: {e}")
 
-    # Step 7.5: Simulate conversion for top models for plotting
+    # Step 7.5: Simulate conversion for top models for plotting, with the
+    # bootstrap confidence band where one exists for that model.
     for fit_res in top_fit_results:
         try:
-            simulated_conversions = []
+            simulated_conversions, simulated_ci = [], []
+            fit_bootstrap = bootstrap_results.get(fit_res.model_name) if bootstrap_results else None
             for ds in datasets:
-                temp_func = lambda t: np.interp(t, ds.time, ds.temperature)
-                pred_result = predict_conversion(
-                    kinetic_description=fit_res,
-                    temperature_program=temp_func,
-                    simulation_time_sec=ds.time,
-                    initial_alpha=0.0
-                )
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    if fit_res.model_name.startswith('Empirical_'):
+                        pred_result = _predict_empirical_with_ci(
+                            fit_result=fit_res, time_points=ds.time,
+                            temperature_K=float(np.mean(ds.temperature)),
+                            bootstrap_result=fit_bootstrap,
+                        )
+                    else:
+                        pred_result = predict_conversion(
+                            kinetic_description=fit_res,
+                            temperature_program=(ds.time, ds.temperature),
+                            simulation_time_sec=ds.time,
+                            initial_alpha=0.0,
+                            bootstrap_result=fit_bootstrap,
+                        )
                 simulated_conversions.append(pred_result.conversion)
-            # Add as attribute to FitResult object
+                simulated_ci.append(pred_result.conversion_ci)
+            # Add as attributes to FitResult object (read by reporting.py)
             fit_res.conversion_simulated = simulated_conversions
+            fit_res.conversion_simulated_ci = simulated_ci if any(c is not None for c in simulated_ci) else None
         except Exception as e:
             warnings.warn(f"Failed to simulate conversion for plotting: {e}")
             fit_res.conversion_simulated = None
+            fit_res.conversion_simulated_ci = None
 
     # Step 8: Generate summary
     actual_bootstrap_iters = 0
@@ -1838,7 +2110,15 @@ def auto_model_isothermal_data(
         'models_tried': len(models_config),
         'models_successful': len(ranked_models),
         'top_n_selected': len(top_models_data),
-        'bootstrap_iterations': actual_bootstrap_iters
+        'bootstrap_method': bootstrap_method,
+        'bootstrap_iterations_requested': bootstrap_iterations,
+        'bootstrap_iterations': actual_bootstrap_iters,
+        'confidence_level': confidence_level,
+        'shelf_life_temperature_C': shelf_life_temperature_C,
+        'shelf_life_target_conversion': shelf_life_target_conversion,
+        'shelf_life_confidence_level': shelf_life_confidence_level,
+        'shelf_life_is_long_term': shelf_life_is_long_term,
+        'shelf_life_nonlinearity_p_threshold': shelf_life_nonlinearity_p_threshold,
     }
 
     # Step 9: Generate HTML report
@@ -1854,7 +2134,7 @@ def auto_model_isothermal_data(
             report_format=report_format,
             summary=summary,
             fit_results=top_fit_results,  # Pass the actual FitResult objects for plotting
-            regulatory=regulatory_results  # ICH Q1E regulatory analysis (always included if available)
+            regulatory=regulatory_results  # Shelf-life trend estimate, when available
         )
         progress(f"Report saved to: {report_path_final}", {'report_path': report_path_final})
 
@@ -1873,9 +2153,9 @@ def auto_model_isothermal_data(
         'predictions': predictions_dict,
         'simulation': simulation_dict,
         'report_path': str(report_path) if report_path else None,
-        'bootstrap_results': bootstrap_results if bootstrap_results else None,
+        'bootstrap_results': _bootstrap_results_by_display_name(bootstrap_results, fit_result_names),
         'summary': summary,
-        'regulatory': regulatory_results,  # ICH Q1E regulatory analysis
+        'regulatory': regulatory_results,  # Shelf-life trend estimate
         # Additional objects for advanced users
         'datasets': datasets,  # Original datasets for custom plotting
         'fit_results': fit_result_names,  # FitResult objects by model name
