@@ -450,10 +450,89 @@ def rank_replicates(
     return ranked
 
 
+# A replicate is refit to its own resampled data, so a converged refit has RSS
+# comparable to its peers. Refits whose RSS is this many times the median
+# diverged (optimizer failure, not sampling variation) and are excluded.
+FAILED_REFIT_RSS_FACTOR = 10.0
+
+
+def _converged_replicate_mask(stats_list: List[Dict]) -> np.ndarray:
+    rss = np.array([s.get('rss', np.nan) for s in stats_list], dtype=float)
+    finite = np.isfinite(rss)
+    if finite.sum() < 3:
+        return finite
+    return finite & (rss <= FAILED_REFIT_RSS_FACTOR * np.median(rss[finite]))
+
+
 def _percentile_ci(values: np.ndarray, confidence_level: float) -> Tuple[float, float]:
+    """
+    Calculate two-sided confidence interval (for parameter reporting).
+
+    Note: For ICH Q1E-compliant shelf-life determination, use
+    _percentile_ci_one_sided() instead.
+    """
     tail = (1.0 - confidence_level) / 2.0
     lo, hi = np.percentile(values, [tail * 100.0, (1.0 - tail) * 100.0])
     return float(lo), float(hi)
+
+
+def _percentile_ci_one_sided(
+    values: np.ndarray,
+    confidence_level: float,
+    side: str = 'lower'
+) -> float:
+    """
+    Calculate one-sided confidence limit per ICH Q1E requirements.
+
+    ICH Q1E mandates one-sided confidence bounds for shelf-life determination:
+    - For decreasing attributes (potency, monomer): use lower bound
+    - For increasing attributes (aggregates, impurities): use upper bound
+
+    Parameters
+    ----------
+    values : np.ndarray
+        Bootstrap distribution
+    confidence_level : float
+        Confidence level (typically 0.95)
+    side : str
+        'lower' for decreasing attributes (potency, monomer)
+        'upper' for increasing attributes (aggregates, impurities)
+
+    Returns
+    -------
+    float
+        One-sided confidence limit
+
+    Notes
+    -----
+    For 95% confidence:
+    - Lower one-sided bound: 5th percentile (NOT 2.5th)
+    - Upper one-sided bound: 95th percentile (NOT 97.5th)
+
+    This is NOT a two-sided interval [2.5%, 97.5%].
+
+    References
+    ----------
+    ICH Q1E: "Evaluation of Stability Data"
+    - Section on confidence intervals for shelf-life determination
+    - Requires one-sided 95% confidence limits
+
+    Examples
+    --------
+    >>> values = np.random.normal(100, 10, size=1000)
+    >>> lower_bound = _percentile_ci_one_sided(values, 0.95, side='lower')
+    >>> # For 95% CI, lower_bound ≈ 5th percentile
+    """
+    if side == 'lower':
+        # Lower 95% one-sided limit: 5th percentile
+        percentile = (1.0 - confidence_level) * 100.0
+    elif side == 'upper':
+        # Upper 95% one-sided limit: 95th percentile
+        percentile = confidence_level * 100.0
+    else:
+        raise ValueError(f"side must be 'lower' or 'upper', got '{side}'")
+
+    return float(np.percentile(values, percentile))
 
 
 # --- Public entry points ----------------------------------------------------
@@ -531,6 +610,13 @@ def run_bootstrap(
             successful_stats.append(data['stats'])
         else:
             warnings.warn(f"Replicate {i+1} returned unexpected dict keys.")
+    converged = _converged_replicate_mask(successful_stats)
+    n_diverged = int(len(converged) - converged.sum())
+    if n_diverged:
+        warnings.warn(f"Excluded {n_diverged} bootstrap refits that did not converge "
+                      f"(RSS > {FAILED_REFIT_RSS_FACTOR:g}x the median replicate RSS).")
+        successful_params_logA = [p for p, ok in zip(successful_params_logA, converged) if ok]
+        successful_stats = [s for s, ok in zip(successful_stats, converged) if ok]
     n_success = len(successful_params_logA)
     print(f"\nBootstrap finished processing. {n_success}/{n_iterations} replicates successful "
           f"({n_iterations - n_success} failed/timed out).")
@@ -617,6 +703,12 @@ def run_bootstrap_empirical(
 
     print("\nProcessing received results...")
     successful = [r for r in results if isinstance(r, dict) and 'params' in r and 'stats' in r]
+    converged = _converged_replicate_mask([r['stats'] for r in successful])
+    n_diverged = int(len(converged) - converged.sum())
+    if n_diverged:
+        warnings.warn(f"Excluded {n_diverged} bootstrap refits that did not converge "
+                      f"(RSS > {FAILED_REFIT_RSS_FACTOR:g}x the median replicate RSS).")
+        successful = [r for r, ok in zip(successful, converged) if ok]
     n_successful = len(successful)
     print(f"\nBootstrap finished processing. {n_successful}/{n_iterations} replicates successful "
           f"({n_iterations - n_successful} failed/timed out).")

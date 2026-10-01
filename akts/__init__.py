@@ -12,11 +12,17 @@ from .isoconversional import (run_friedman, run_kas, run_ofw, run_vyazovkin,
                                estimate_compensation_parameters)
 # Expose model registration and listing functions
 from .models import (register_f_alpha_model, register_ode_system, list_available_models,
-                     F_ALPHA_MODELS, ODE_SYSTEMS)
+                     F_ALPHA_MODELS, ODE_SYSTEMS, generate_sb_grid_models,
+                     generate_sb2_grid_models)
 # Expose data loaders
 from .loaders import (load_data_file, load_dsc_file, load_tga_file, load_isothermal_file)
 # Expose helper functions (high-level user-friendly functions)
 from .helpers import auto_model_isothermal_data, time_to_conversion, time_to_conversion_model_free, calculate_ich_q1e_ceiling
+# Expose shelf-life functions (ICH Q1E compliance)
+from .shelf_life import calculate_shelf_life_ich_q1e, time_to_specification
+# Expose plausibility checking functions
+from .plausibility import (check_parameter_plausibility, add_plausibility_to_fit,
+                           filter_implausible_bootstrap_replicates, calculate_ci_quality_score)
 # Expose validation functions
 from .validation import run_leave_one_out_cv
 # Expose export utilities
@@ -54,6 +60,14 @@ __all__ = [
     'time_to_conversion',
     'time_to_conversion_model_free',
     'calculate_ich_q1e_ceiling',
+    # Shelf-life functions (ICH Q1E compliance)
+    'calculate_shelf_life_ich_q1e',
+    'time_to_specification',
+    # Plausibility checking functions
+    'check_parameter_plausibility',
+    'add_plausibility_to_fit',
+    'filter_implausible_bootstrap_replicates',
+    'calculate_ci_quality_score',
     # Validation functions
     'run_leave_one_out_cv',
     # Export utilities
@@ -77,6 +91,8 @@ __all__ = [
     'register_f_alpha_model',
     'register_ode_system',
     'list_available_models',
+    'generate_sb_grid_models',
+    'generate_sb2_grid_models',
     'F_ALPHA_MODELS',
     'ODE_SYSTEMS',
     # Data loaders

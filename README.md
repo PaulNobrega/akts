@@ -17,6 +17,7 @@ AKTS is a Python library for Arrhenius Kinetics Thermal Simulations. It analyzes
 
 - **[Getting Started](docs/getting_started.md)** - Installation and first analysis
 - **[Automated Analysis Guide](docs/automated_analysis.md)** - One-function workflow for non-experts
+- **[ICH Q1E Compliance Guide](docs/ich_q1e_compliance.md)** - Regulatory-compliant shelf-life determination
 - **[JSON I/O Specification](docs/json_io_specification.md)** - Web API integration
 - **[API Reference](docs/api_reference.md)** - Complete function reference
 - **[Kinetic Models Guide](docs/kinetic_models.md)** - Model equations and mechanisms
@@ -113,10 +114,16 @@ Type `models.` and see all available models organized by category (kinetic, empi
 - Physical plausibility filter flags or excludes unrealistic parameter values
 - Bootstrap confidence intervals with automatic quality control filtering
 
-### ICH Q1E Regulatory Compliance
-- Automatic shelf-life estimation with one-sided 95% confidence intervals
+### ICH Q1E Regulatory Compliance ✅
+- **Full ICH Q1E compliance** for pharmaceutical stability submissions
+- **Automatic one-sided 95% confidence bounds** (not two-sided intervals)
+- **Confidence-band crossing method** for conservative shelf-life estimates
+- **Auto-detection** of attribute direction from data type
+- **Default enabled** with 5% specification limit
 - Built-in ICH Q1E extrapolation ceiling calculation
-- Interactive HTML reports include regulatory analysis section with explanatory notes
+- Interactive HTML reports include regulatory analysis section
+
+**[Read ICH Q1E Compliance Guide](docs/ich_q1e_compliance.md)**
 
 ### Multistart ODE Fitting
 Reliable fitting for multi-step reactions (A→B→C, A+B→C) via Arrhenius-reparameterized local optimization from several starting points.

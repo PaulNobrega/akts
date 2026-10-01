@@ -86,12 +86,13 @@ webbrowser.open('stability_report.html')
 ```
 
 **What this does:**
-1. Loads your CSV files
+1. Loads your CSV files (keeping all replicate points) and scales every file to one shared conversion range
 2. Tries 12 common kinetic models
-3. Ranks them statistically
-4. Selects the best model
-5. Generates predictions with confidence intervals
-6. Creates an interactive HTML report with plots
+3. Filters models by R² ≥ 0.70 and physical plausibility
+4. Ranks survivors by Akaike weights (probability each is best)
+5. Selects the top-ranked model
+6. Generates predictions with two-sided 95% bootstrap confidence intervals
+7. Creates an interactive HTML report with plots
 
 [Automated analysis guide](automated_analysis.md)
 
@@ -351,7 +352,7 @@ bootstrap_iterations=200  # Better accuracy
 
 The HTML report shows:
 - Model comparison table
-- Fit quality plots
+- Fit plots, one panel per temperature, with a 95% confidence interval (curve uncertainty) and a wider 95% prediction interval (where about 95% of data points should fall)
 - Arrhenius plot
 - Predictions with confidence bands
 - Parameter uncertainties
@@ -368,11 +369,14 @@ output_temperature_units='F'  # Report in Fahrenheit
 
 ### 7. ODE Models Optional
 
-ODE models (A→B→C, A+B→C) are powerful but slow. Enable only if simple models don't fit:
+ODE models (A→B→C, A+B→C) and the two-step Sestak-Berggren models (SB2, SB2 grid) are powerful but slow. Enable only if simple models don't fit:
 
 ```python
-models_to_try=models.default + models.ode.all  # Include ODE models
+models_to_try=models.default + models.ode.all      # Include ODE models
+models_to_try=models.default + models.kinetic.SB2  # Two-step SB, fitted orders
 ```
+
+`models.all` includes the 136-model `models.kinetic.SB2_grid` and can take 10-15 minutes longer.
 
 ## Troubleshooting
 
@@ -397,7 +401,7 @@ models_to_try=models.default + models.ode.all  # Include ODE models
 **Problem:** Analysis taking too long
 
 **Solutions:**
-- Use `models.default` in `models_to_try` to omit ODE models.
+- Use `models.default` in `models_to_try` to omit ODE and SB2 models (avoid `models.all` unless needed).
 - Reduce bootstrap iterations: `bootstrap_iterations=50`
 - Use fewer models: `models_to_try=['F1', 'F2', 'A2']`
 
@@ -450,6 +454,7 @@ predict=(6, 'month')       # Extrapolate 6 months
 - **D2, D3** - Diffusion-controlled
 - **R2, R3** - Contracting geometry
 - **SB_mn** - Sestak-Berggren (general autocatalytic)
+- **SB2** - Two parallel Sestak-Berggren steps (ODE)
 - **Bna** - Prout-Tompkins (autocatalytic)
 - **A→B→C** - Consecutive reactions (ODE)
 - **A+B→C** - Bimolecular reaction (ODE)

@@ -6,10 +6,11 @@ Complete documentation for the AKTS Python library for kinetic analysis.
 
 ### Getting Started
 - **[Quick Start Guide](getting_started.md)** - Installation and first steps
-- **[Example Scripts](examples.md)** - How to run and understand the examples
+- **[Example Scripts](examples.md)** - How to run and understand the examples, including the AKTS commercial comparison
 
 ### For Non-Expert Users
 - **[Automated Analysis Guide](automated_analysis.md)** - Using `auto_model_isothermal_data()`
+- **[ICH Q1E Compliance Guide](ich_q1e_compliance.md)** - Shelf-life determination, one-sided bounds, CI vs PI bands
 - **[JSON Input/Output Specification](json_io_specification.md)** - Web API integration
 
 ### For Expert Users
@@ -18,8 +19,12 @@ Complete documentation for the AKTS Python library for kinetic analysis.
 
 ### Scientific Background
 - **[Kinetic Models Guide](kinetic_models.md)** - Model equations, mechanisms, and applications
+- **[Model Selection](model_selection.md)** - Ranking by Akaike weight after R² and physical plausibility filters
+- **[Model Selection Criteria](model_selection_criteria.md)** - Filter-then-rank details and plausibility limits
 - **[Model Selection Guide](model_selection_guide.md)** - When to use which model
 - **[Model Selector Guide](model_selector.md)** - IDE autocomplete for model discovery
+- **[Sestak-Berggren Grid Search](SB_GRID_SEARCH.md)** - SB grid, two-step SB2 and SB2_grid models
+- **[Data Quality Weighting](data_quality_weighting.md)** - Replicate handling (kept by default) and weighted fitting
 - **[Experimental Design](experimental_design.md)** - How to design isothermal, DSC, and TGA experiments
 
 ### Technical Details
@@ -31,12 +36,14 @@ Complete documentation for the AKTS Python library for kinetic analysis.
 ## Quick Navigation
 
 - [Analyze stability data](automated_analysis.md)
+- [Calculate ICH Q1E-compliant shelf-life](ich_q1e_compliance.md)
 - [Discover available models with IDE autocomplete](model_selector.md)
 - [Integrate with a web API](json_io_specification.md)
 - [Review kinetic models](kinetic_models.md)
 - [Design experiments](experimental_design.md)
 - [Use the API directly](api_reference.md)
 - [Choose a model](model_selection_guide.md)
+- [Fit a two-step SB model (SB2)](SB_GRID_SEARCH.md#two-step-sestak-berggren-sb2)
 - [Troubleshoot an issue](troubleshooting.md)
 
 ## Getting Help

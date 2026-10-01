@@ -46,8 +46,12 @@ output/
 *.html
 *.png
 *.csv
+!Examples/**/*.csv
 !Examples/**/*.py
 !docs/**/*.png
 !Examples/Isothermal/output/
 !Examples/Isothermal/output/data_multi_temperature.png
 !Examples/Isothermal/output/isothermal_stability_report.html
+
+# Local tooling
+.claude/

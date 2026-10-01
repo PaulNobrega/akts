@@ -115,14 +115,28 @@ dataset = load_isothermal_file(
    readout_type='decreasing'  # e.g., intact%, remaining mass
    ```
 
-2. **Normalize manually:**
+2. **Set the conversion scale explicitly:**
+   ```python
+   # conversion = (readout - readout_initial) / (readout_final - readout_initial)
+   results = auto_model_isothermal_data(
+       data_files=files,
+       readout_type='increasing',
+       readout_final=100.0,   # commercial AKTS %HMW scaling: (HMW - HMW0)/(100 - HMW0)
+   )
+   ```
+   Without `readout_initial` / `readout_final`, all files share one scale: the
+   mean first readout is conversion 0 and the maximum observed readout (minimum
+   for decreasing readouts) is conversion 1. Fitted Ea and A depend on this
+   scale, so set `readout_final` when comparing with another tool.
+
+3. **Normalize manually:**
    ```python
    import pandas as pd
    df = pd.read_csv('data.csv')
    df['conversion'] = (df['readout'] - df['readout'].min()) / (df['readout'].max() - df['readout'].min())
    ```
 
-3. **Check for outliers:**
+4. **Check for outliers:**
    ```python
    print(df['conversion'].describe())
    # Look for values < 0 or > 1
@@ -156,7 +170,7 @@ dataset = load_isothermal_file(
 3. **Widen parameter bounds:**
    ```python
    parameter_bounds={
-       'Ea': (10000, 300000),  # Wider Ea range
+       'Ea': (5e3, 1000e3),    # Full default range, akts.utils.EA_BOUNDS
        'A': (1e3, 1e25)        # Wider A range
    }
    ```
@@ -236,6 +250,27 @@ several starting points and the best-R² result is kept. See
    models_to_try=models.default  # Use default kinetic models only
    ```
 
+### Fitted Ea is at the fitting bound
+
+**Problem:** Warning `Fitted Ea1 (1000.0 kJ/mol) is at the fitting bound (5-1000 kJ/mol); the optimum may lie outside it.`
+
+**Explanation:** Every Ea parameter is fitted within `akts.utils.EA_BOUNDS` (5-1000 kJ/mol). A value at the bound means the data do not pin Ea down inside that range. This is common for the steep step of SB2, whose Ea is poorly identified when only one or two temperatures show that step.
+
+**Solutions:**
+- Treat the bound-limited Ea as a lower (or upper) limit, not an estimate
+- Compare with the typical ranges in the report (thermal denaturation/unfolding 400-800 kJ/mol, enzymatic/proteolytic cleavage 20-100, spontaneous/pyrolytic hydrolysis 90-140)
+- Add temperatures in the region where that step dominates, or try a simpler model
+
+### Warning: No physically plausible models achieved R² ≥ 0.70
+
+**Problem:** Ranking warns that the selected model has questionable plausibility.
+
+**Explanation:** Plausibility requires every A parameter below 1e20 s⁻¹ and Ea at most 1000 kJ/mol. When no model with R² ≥ `min_r_squared` passes, the models that meet the R² threshold are ranked anyway and this warning is attached (`filter_warning['type'] == 'no_plausible_models'`). SB2 always triggers it when it is the only candidate: its fast step needs A of about 1e166 or more. The model is still selected.
+
+**Solutions:**
+- For SB2, the warning refers to the A values and is expected
+- For other models, check the parameters for a bound-limited or extreme fit before relying on predictions
+
 ### Conversion-based fit failed, falling back to RATE
 
 **Problem:** Warning appears during fitting
@@ -305,7 +340,7 @@ if __name__ == '__main__':
 2. **Widen bounds:**
    ```python
    parameter_bounds={
-       'Ea': (20000, 250000),  # Wider
+       'Ea': (5e3, 1000e3),  # Default Ea range (akts.utils.EA_BOUNDS)
        'A': (1e5, 1e20)
    }
    ```
@@ -342,6 +377,32 @@ if __name__ == '__main__':
    ```python
    predict=(1, 'year')  # Instead of (10, 'year')
    ```
+
+### Confidence Bands Invisible in Plots
+
+**Problem:** Fit plots show no band at low-conversion temperatures.
+
+**Explanation:** A refrigerated series that reaches 0.5% conversion can have a band only about 0.2 percentage points wide, which disappears on a shared 0-100% axis. The report's fit plots (interactive and static) draw one panel per temperature with its own y-scale and a time axis in days, so these bands are visible there. For your own figures, plot each temperature separately.
+
+### Data Points Fall Outside the Confidence Band
+
+**Problem:** Many measured points lie outside the fitted CI.
+
+**Explanation:** The 95% CI covers uncertainty of the fitted curve only, so data scatter outside it is expected. The lighter 95% prediction interval (PI) drawn behind the CI adds each temperature's residual scatter (half-width `t·sqrt(se_fit² + s_i²)`, where s_i² is that dataset's residual variance). About 95% of points should fall inside the PI. The PI is stored on the fit as `fit_result.conversion_simulated_pi`; `plot_fit_overlay(..., show_pi=True)` draws it (default).
+
+If far fewer than 95% of points fall in the PI, the model does not describe the data.
+
+### Confidence Bands Jump to 100% or Are Missing
+
+**Problem:** Bands reach 100% conversion, or a low-conversion prediction has no CI.
+
+**Explanation and checks:**
+- Bootstrap refits whose RSS exceeds 10x the median replicate RSS are excluded as non-converged; a warning reports how many. These used to push bands to 100%.
+- Prediction CIs drop degenerate replicates whose final conversion is below min(1%, 10% of the main prediction's final value). A warning such as `Filtered 89/89 degenerate bootstrap samples` means the whole prediction is close to that threshold; low-conversion predictions otherwise keep their CI.
+
+### One-Sided vs Two-Sided Bands
+
+Fit, prediction and simulation plots use `ci_type='two-sided'` (default): the 2.5th-97.5th bootstrap percentiles at 95%. `ci_type='one-sided'` gives (MLE curve, 95th percentile). The ICH Q1E bootstrap shelf-life always uses a separately computed one-sided 95th-percentile bound, whatever `ci_type` is. The regression-based ICH Q1E shelf-life plot shows a two-sided 90% band; its edges are the one-sided 95% limits, so the legend reads "One-sided 95% confidence limits".
 
 ### Prediction Confidence Intervals Too Wide
 
@@ -490,6 +551,9 @@ clean_dict = convert_numpy_to_python(results)
    ```python
    models_to_try=models.default  # Omit slower ODE candidates
    ```
+   `models.all` includes SB2 and the 136-model SB2 grid (173 models in total).
+   The SB2 grid alone adds roughly 10-15 minutes; list `models.kinetic.SB2`
+   explicitly instead if you only need the two-step model.
 
 2. **Reduce bootstrap iterations:**
    ```python

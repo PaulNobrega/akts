@@ -184,44 +184,35 @@ class TestOptimizerFindsKnownParameters:
         )
 
 
-class TestSimplestModelWins:
-    """Fix 5: when several models fit indistinguishably well (within 2 BIC of the
-    best), the simplest one should be selected instead of whichever had the best raw
-    BIC by a hair."""
+class TestSelectTopRanked:
+    """Selection returns rank 1 from the Akaike-weight ranking; AIC already
+    accounts for complexity, so there is no simplicity tie-break."""
 
-    def _model(self, name, bic, n_params=2):
-        return {'model_name': name, 'stats': {'bic': bic, 'n_params': n_params}}
+    def _model(self, name, weight, n_params=2):
+        return {'model_name': name, 'stats': {'akaike_weight': weight, 'n_params': n_params}}
 
-    def test_picks_simplest_among_tied_models(self):
-        # A2 has the numerically best BIC by a small margin, but F1 is tied within
-        # the indistinguishability threshold and is simpler by naming convention.
-        ranked = [
-            self._model('A2_model', -500.0),
-            self._model('R2_model', -499.3),
-            self._model('F1_model', -498.5),
-        ]
-        chosen, reason = _select_simplest_equivalent(ranked)
-        assert chosen['model_name'] == 'F1_model'
-        assert 'indistinguishable' in reason.lower()
-
-    def test_picks_outright_winner_when_not_tied(self):
-        ranked = [
-            self._model('A2_model', -500.0),
-            self._model('F1_model', -480.0),  # 20 BIC worse -- not a tie
-        ]
+    def test_returns_rank_one_even_when_simpler_model_is_close(self):
+        ranked = [self._model('A2_model', 0.45), self._model('R2_model', 0.30),
+                  self._model('F1_model', 0.25)]
         chosen, reason = _select_simplest_equivalent(ranked)
         assert chosen['model_name'] == 'A2_model'
-        assert 'no other model' in reason.lower()
+        assert 'competitive' in reason.lower()
 
-    def test_complex_model_wins_if_clearly_better(self):
-        # A 4-parameter ODE model should still win if its BIC is far ahead --
-        # simplicity only breaks ties, it doesn't override a real signal.
-        ranked = [
-            self._model('A->B->C', -700.0, n_params=4),
-            self._model('F1_model', -600.0, n_params=2),
-        ]
-        chosen, _ = _select_simplest_equivalent(ranked)
+    def test_overwhelming_evidence_reason(self):
+        ranked = [self._model('SB_mn_model', 1.0), self._model('F1_model', 0.0)]
+        chosen, reason = _select_simplest_equivalent(ranked)
+        assert chosen['model_name'] == 'SB_mn_model'
+        assert 'overwhelming' in reason.lower()
+
+    def test_complex_model_wins_if_ranked_first(self):
+        ranked = [self._model('A->B->C', 0.8, n_params=4), self._model('F1_model', 0.2)]
+        chosen, reason = _select_simplest_equivalent(ranked)
         assert chosen['model_name'] == 'A->B->C'
+        assert 'strong' in reason.lower()
+
+    def test_empty_ranking_raises(self):
+        with pytest.raises(ValueError):
+            _select_simplest_equivalent([])
 
 
 class TestOdeSolveFailsFast:

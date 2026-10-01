@@ -28,6 +28,21 @@
 |----------|------------|-------------|------------|---------------------|
 | **A->B->C** | Consecutive reactions | Two-step sequential reactions A→B→C, each step follows f(α) mechanism | Ea1, A1, Ea2, A2, f1_model, f2_model | **Multi-step protein degradation**, intermediate species formation, enzymatic cascades |
 | **A+B->C** | Bimolecular | Two species react to form product | Ea, A, initial_ratio_r, m, n | **Protein-ligand binding**, enzyme-substrate reactions, chemical synthesis |
+| **SB2** | Two-step Sestak-Berggren | Two parallel SB steps summed on one conversion (AKTS commercial two-step form) | Ea1, A1, Ea2, A2, m1, n1, m2, n2 | Aggregation with a slow low-temperature step and a steep high-temperature step (e.g. %HMW over 5-40 °C) |
+| **SB2_m{m1}n{n1}_m{m2}n{n2}** | Two-step SB grid | SB2 with fixed integer exponents m, n in {0,1,2,3}; 136 models (every unordered pair of steps) | Ea1, A1, Ea2, A2 | Same as SB2 with interpretable integer orders and fewer fitted parameters |
+
+### Two-Step Sestak-Berggren (SB2)
+
+```
+dα/dt = k1(T)·α^m1·(1-α)^n1 + k2(T)·α^m2·(1-α)^n2,   ki(T) = Ai·exp(-Eai/RT)
+```
+
+- **SB2** fits all eight parameters. Exponent bounds are m1, m2 in [0, 3] and n1, n2 in [0, 8]; A1 and A2 are bounded to 1e-10 to 1e200 s⁻¹ because the fast step can need A of about 1e166 or more.
+- **SB2 grid** (`models.kinetic.SB2_grid`, `akts.generate_sb2_grid_models(m_range, n_range)`) fixes (m1, n1, m2, n2) from the name and fits only Ea1, A1, Ea2, A2. `akts.models.parse_sb2_model('SB2_m0n1_m1n3')` returns `(0, 1, 1, 3)`. A step with m > 0 needs nonzero conversion to start; the other step provides it.
+- Both are ODE-integrated. SB2 is fitted with `scipy.optimize.least_squares` (TRF) on the ODE residuals; Powell fails on this 8-parameter model. In `auto_model_isothermal_data()` each SB2 model starts from data-driven Arrhenius guesses (zero-order fits of the low- and high-conversion datasets, both step orderings) plus the default guess, and the fit with the lowest AIC is kept.
+- Neither is in `models.default`. `models.all` includes both (173 models in total, 136 of them SB2 grid), so a `models.all` run takes much longer; the SB2 grid alone adds roughly 10-15 minutes.
+- SB2's fitted A values exceed the 1e20 s⁻¹ plausibility limit, so SB2 fits count as not physically plausible. When SB2 models are the only candidates, ranking keeps them and warns "No physically plausible models achieved R² ≥ 0.70"; the model is still selected. When a plausible candidate (for example F1) also reaches `min_r_squared`, the filter removes SB2 before ranking; use `apply_filters=False` or run SB2 on its own to compare it.
+- The steep step's Ea is often poorly identified and can end at the 1000 kJ/mol fitting bound (a bound warning is issued). On the synthetic two-step data in `Examples/Commercial_AKTS_Comp_Isothermal`, SB2 recovers the steep step closely (Ea 248 vs 250 kJ/mol) and the slow step's Ea and A, but the slow step's n goes to its bound of 8 because the low-temperature data barely convert.
 
 ## Empirical Algebraic Models
 
@@ -96,6 +111,9 @@ interpreted as evidence of a reaction mechanism.
 **Multiple Stages** (intermediates):
 - Try: **A->B->C** (consecutive)
 
+**Two Temperature Regimes** (slow low-temperature and steep high-temperature degradation):
+- Try: **SB2**, SB2 grid
+
 ## Automated Model Selection
 
 When `models_to_try` is omitted, `auto_model_isothermal_data()` uses
@@ -129,20 +147,36 @@ adapt to the conversion range in the data. See
 See the [Model Selector Guide](model_selector.md) for available model groups and
 selection examples.
 
-**Ranking and selection:** The default combined score uses normalized BIC (weight 0.4), R² (0.4), RSS (0.1), and parameter count (0.1). AIC is reported but is not part of this score. After ranking, AKTS selects the simplest model among those with BIC less than 2 above the lowest BIC. If no other model meets that threshold, the lowest-BIC model is selected.
+**Ranking and selection:** `rank_models()` first filters, then ranks by Akaike weight only:
+
+1. Models with R² ≥ `min_r_squared` (default 0.70) that are physically plausible are kept.
+2. If none are plausible, models with R² ≥ `min_r_squared` are kept and a `no_plausible_models` warning is attached.
+3. If no model reaches `min_r_squared`, all models are kept with a `no_good_models` warning.
+
+The survivors are sorted by Akaike weight, and the rank-1 model is selected. No extra simplicity penalty is applied, because the 2k term in AIC already penalizes complexity. The selection reason reports the weight: ≥ 0.90 overwhelming, ≥ 0.70 strong, ≥ 0.50 substantial, otherwise best of N competitive models.
+
+A fit counts as physically plausible when every A parameter is below 1e20 s⁻¹ and Ea does not exceed 1000 kJ/mol (the fitting bounds already keep it at 5 kJ/mol or above). `akts.utils.check_physical_plausibility(params, strict=True)` applies the narrower typical range of 30-180 kJ/mol.
 
 The statistics are interpreted as follows:
-1. **R²** (coefficient of determination) - higher is better
-2. **AIC** (Akaike Information Criterion) - lower is better; reported for comparison
-3. **BIC** (Bayesian Information Criterion) - lower is better; also used for the final simplicity comparison
-4. **RSS** (Residual Sum of Squares) - lower is better
-5. **Parameter count** - fewer parameters are preferred when BIC indicates comparable fit
+1. **Akaike weight** - probability that the model is the best in the candidate set; used for ranking
+2. **AIC** (Akaike Information Criterion) - lower is better; the basis of the Akaike weight
+3. **R²** (coefficient of determination) - higher is better; used as a filter
+4. **BIC** (Bayesian Information Criterion) - lower is better; reported for comparison
+5. **RSS** (Residual Sum of Squares) - lower is better; reported for comparison
 
 ## Parameter Interpretation
 
 ### For Single-Step Models:
-- **Ea** (activation energy): Arrhenius temperature-sensitivity parameter, reported in J/mol. Interpret it in the context of the reaction, data range, and fitted model; a threshold alone does not establish whether a fit is physically plausible.
+- **Ea** (activation energy): Arrhenius temperature-sensitivity parameter, reported in J/mol. Every Ea parameter (single-step, grid, ODE, empirical, bootstrap) is fitted within `akts.utils.EA_BOUNDS` = 5-1000 kJ/mol. `fit_kinetic_model()` warns when a fitted Ea sits at a bound, since the optimum may lie outside it. Interpret Ea in the context of the reaction, data range, and fitted model; a threshold alone does not establish whether a fit is physically plausible.
 - **A** (pre-exponential factor): Arrhenius rate prefactor, reported in s⁻¹ for single-step fits. Its interpretation depends on the model and parameterization; compare values only when units and model definitions are consistent.
+
+The HTML report lists typical activation energy ranges next to the reported Ea:
+
+| Mechanism | Typical Ea (kJ/mol) |
+|-----------|---------------------|
+| Thermal denaturation and unfolding (upper limit) | 400-800 |
+| Enzymatic / proteolytic cleavage | 20-100 |
+| Spontaneous / pyrolytic hydrolysis | 90-140 |
 
 ### For A->B->C Model:
 - **Ea1, A1**: Parameters for first step (A→B)

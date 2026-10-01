@@ -36,7 +36,7 @@ class TestPhysicalPlausibilityCheck:
 
     def test_very_low_ea(self):
         """Test very low Ea is flagged."""
-        params = {'Ea': 5000, 'A': 1e10}  # 5 kJ/mol - too low
+        params = {'Ea': 2000, 'A': 1e10}  # 2 kJ/mol - below 5 kJ/mol bound
         is_plausible, issues = check_physical_plausibility(params, strict=False)
 
         assert not is_plausible, "Very low Ea should be implausible"
@@ -46,7 +46,7 @@ class TestPhysicalPlausibilityCheck:
 
     def test_very_high_ea(self):
         """Test very high Ea is flagged."""
-        params = {'Ea': 500000, 'A': 1e10}  # 500 kJ/mol - too high
+        params = {'Ea': 1200000, 'A': 1e10}  # 1200 kJ/mol - above 1000 kJ/mol bound
         is_plausible, issues = check_physical_plausibility(params, strict=False)
 
         assert not is_plausible, "Very high Ea should be implausible"
@@ -74,7 +74,7 @@ class TestPhysicalPlausibilityCheck:
 
     def test_multiple_issues(self):
         """Test multiple issues are reported."""
-        params = {'Ea': 5000, 'A': 1e30}  # Both Ea and A implausible
+        params = {'Ea': 2000, 'A': 1e30}  # Both Ea and A implausible
         is_plausible, issues = check_physical_plausibility(params, strict=False)
 
         assert not is_plausible

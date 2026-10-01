@@ -26,7 +26,7 @@ from scipy.optimize import minimize, least_squares, OptimizeResult
 from .datatypes import KineticDataset, FitResult
 from .models import get_model_info, get_log_param_names, has_closed_form, CLOSED_FORM_REGISTRY
 from .utils import (get_temperature_interpolator, calculate_aic, calculate_bic, numerical_diff,
-                    is_isothermal, calculate_durbin_watson, check_physical_plausibility)
+                    is_isothermal, calculate_durbin_watson, check_physical_plausibility, EA_BOUNDS)
 from .simulation import (_split_logA_name, _ArrheniusReparam, _initial_state,
                          _simulate_single_dataset, _simulate_single_dataset_closed_form,
                          params_logA_to_A)
@@ -174,7 +174,11 @@ def _objective_function(
         if residuals.size and not valid_mask.any():
             total_weighted_rss = np.inf
             continue
+        # Combine transition weights with data quality weights (from replicate averaging)
         weights = transition_weights(ds.conversion)[valid_mask]
+        if ds.weights is not None:
+            # Multiply by data quality weights (inverse variance from replicate std)
+            weights = weights * ds.weights[valid_mask]
         rss = float(np.sum(weights * residuals[valid_mask] ** 2))
         total_weighted_rss += rss if np.isfinite(rss) else np.inf
 
@@ -230,7 +234,10 @@ def _residual_vector_function(
             continue
         residuals = ds.conversion - alpha_sim
         valid_mask = np.isfinite(residuals) & np.isfinite(alpha_sim)
+        # Combine transition weights with data quality weights (from replicate averaging)
         sqrt_weights = np.sqrt(transition_weights(ds.conversion))
+        if ds.weights is not None:
+            sqrt_weights = sqrt_weights * np.sqrt(ds.weights)
         residuals_list.append(residuals[valid_mask] * sqrt_weights[valid_mask])
 
     if not residuals_list:
@@ -416,7 +423,7 @@ def _default_bounds_logA(param_names_logA: List[str]) -> Dict[str, Tuple[float, 
     bounds = {}
     for p_name in param_names_logA:
         if p_name.startswith("Ea"):
-            bounds[p_name] = (1e3, 600e3)
+            bounds[p_name] = EA_BOUNDS
         elif p_name.startswith("logA"):
             bounds[p_name] = (np.log(1e-2), np.log(1e25))
         elif p_name.endswith("n") or p_name.endswith("m") or p_name.startswith("p1_") or p_name.startswith("p2_"):
@@ -558,6 +565,41 @@ def _optimize(
             warnings.warn(f"least_squares optimization failed: {e_lsq}. Falling back to Powell.")
             alpha_of_kt = None
             opt_result = None
+
+    # --- SB2: least_squares on ODE residuals. Powell's bounded line search wanders off
+    # the narrow valley of this 8-parameter model and returns points far worse than its start.
+    if alpha_of_kt is None and model_name == "SB2":
+        try:
+            ctx = _build_context(datasets, model_name, model_definition_args, solver_options)
+            if coarse_start:
+                objective_args = (param_names_logA, datasets, model_name, model_definition_args,
+                                  solver_options, None, [0], ctx)
+                x0_internal = reparam.coarse_start(x0_internal, _objective_function, objective_args,
+                                                   bounds_internal, deadline=deadline)
+            if bounds_internal:
+                bounds_lsq = (np.array([b[0] if b[0] is not None else -np.inf for b in bounds_internal]),
+                              np.array([b[1] if b[1] is not None else np.inf for b in bounds_internal]))
+                x0_internal = np.clip(x0_internal, bounds_lsq[0], bounds_lsq[1])
+            else:
+                bounds_lsq = (-np.inf, np.inf)
+            residual_args = (param_names_logA, datasets, model_name, model_definition_args,
+                             solver_options, False, None, callback, [0], ctx)
+            opt_result = least_squares(
+                fun=reparam.wrap_residual(_residual_vector_function), x0=x0_internal,
+                args=residual_args, bounds=bounds_lsq, method='trf', x_scale='jac',
+                ftol=1e-10, xtol=1e-10, max_nfev=3000, jac='2-point', verbose=0,
+            )
+            if getattr(opt_result, 'jac', None) is not None:
+                J = opt_result.jac
+                opt_result.hess_inv = np.linalg.inv(J.T @ J + 1e-12 * np.eye(len(param_names_logA)))
+            opt_result.success = bool(opt_result.status > 0)
+        except Exception as e_lsq:
+            return _OptimizeOutcome(None, False, f"SB2 least_squares failed: {e_lsq}", reparam, early_failure=True)
+        if not opt_result.success:
+            return _OptimizeOutcome(None, False, f"SB2 least_squares failed: {opt_result.message}", reparam)
+        opt_result.x = reparam.to_external(opt_result.x)
+        opt_result.hess_inv = reparam.J @ opt_result.hess_inv @ reparam.J.T
+        return _OptimizeOutcome(opt_result, False, str(opt_result.message), reparam)
 
     # --- Standard path: Powell on the weighted conversion objective (ODE) ---
     if alpha_of_kt is None:
@@ -748,10 +790,9 @@ def fit_kinetic_model(
 
     for p_name, p_val in fitted_params_final.items():
         if p_name.startswith("Ea"):
-            if p_val < 5e3:
-                warnings.warn(f"Fitted {p_name} ({p_val/1000:.1f} kJ/mol) is very low.")
-            if p_val > 400e3:
-                warnings.warn(f"Fitted {p_name} ({p_val/1000:.1f} kJ/mol) is very high.")
+            if p_val <= EA_BOUNDS[0] * 1.001 or p_val >= EA_BOUNDS[1] * 0.999:
+                warnings.warn(f"Fitted {p_name} ({p_val/1000:.1f} kJ/mol) is at the fitting bound "
+                              f"({EA_BOUNDS[0]/1000:.0f}-{EA_BOUNDS[1]/1000:.0f} kJ/mol); the optimum may lie outside it.")
         elif p_name.startswith("A"):
             if p_val < 1e-1:
                 warnings.warn(f"Fitted {p_name} ({p_val:.1e} 1/s) is very low.")
@@ -765,6 +806,12 @@ def fit_kinetic_model(
             initial_r = float(fixed_r)
         elif 'initial_ratio_r' in fitted_params_logA:
             initial_r = float(fitted_params_logA['initial_ratio_r'])
+
+    # Check physical plausibility of fitted parameters
+    from .plausibility import check_parameter_plausibility
+    is_plausible, plausibility_issues = check_parameter_plausibility(
+        fitted_params_final, strict=False
+    )
 
     return FitResult(
         model_name=model_name, model_definition_args=model_definition_args,
@@ -786,10 +833,12 @@ def discover_kinetic_models(
     parameter_bounds_pool: Optional[Dict[str, Dict]] = None,
     solver_options: Optional[Dict] = None,
     optimizer_options: Optional[Dict] = None,
-    score_weights: Optional[Dict[str, float]] = None
+    min_r_squared: float = 0.70,
+    apply_filters: bool = True,
 ) -> List[Dict]:
     """
-    Fits multiple kinetic models to the data and ranks them using a combined score.
+    Fits multiple kinetic models to the data and ranks them by Akaike weight
+    (see rank_models for the R² and plausibility filters).
     """
     all_fit_results = []
     print(f"--- Starting Kinetic Model Discovery ({len(models_to_try)} models) ---")
@@ -826,7 +875,7 @@ def discover_kinetic_models(
         print("No models fitted successfully.")
         return []
 
-    ranked_list = rank_models(all_fit_results, score_weights=score_weights)
-    print(f"Ranking {len(ranked_list)} successful models by combined score...")
+    ranked_list = rank_models(all_fit_results, min_r_squared=min_r_squared, apply_filters=apply_filters)
+    print(f"Ranked {len(ranked_list)} models by Akaike weight.")
 
     return ranked_list

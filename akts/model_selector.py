@@ -89,13 +89,51 @@ class _KineticModels:
         return ['SB_mn']
 
     @property
+    def SB(self) -> List[str]:
+        """Sestak-Berggren with fitted m,n (continuous optimization)."""
+        return ['SB']
+
+    @property
+    def SB_grid(self) -> List[str]:
+        """
+        Sestak-Berggren grid search: all integer combinations m,n ∈ {0,1,2,3}.
+
+        Returns 16 models with fixed integer m,n values. Recommended over continuous
+        SB optimization for mechanistic interpretability and to prevent overfitting.
+
+        Mechanistic interpretations:
+        - SB_m0_n0: Zero-order (F0)
+        - SB_m0_n1: First-order (F1)
+        - SB_m0_n2: Second-order (F2)
+        - SB_m1_n0: Power law/autocatalytic
+        - SB_m0_n3: Third-order (F3)
+        """
+        from .models import generate_sb_grid_models
+        return generate_sb_grid_models(m_range=range(4), n_range=range(4))
+
+    @property
     def Bna(self) -> List[str]:
         """Prout-Tompkins (autocatalytic, c=1.0)."""
         return ['Bna']
 
     @property
+    def SB2(self) -> List[str]:
+        """Two parallel Sestak-Berggren steps with fitted m1,n1,m2,n2 (AKTS two-step form)."""
+        return ['SB2']
+
+    @property
+    def SB2_grid(self) -> List[str]:
+        """
+        Two-step Sestak-Berggren grid: every unordered pair of integer SB steps,
+        m,n in {0,1,2,3}, summed on one conversion. 136 models, each with 4 fitted
+        parameters (Ea1, A1, Ea2, A2). Implemented like SB_grid, but ODE-integrated.
+        """
+        from .models import generate_sb2_grid_models
+        return generate_sb2_grid_models(m_range=range(4), n_range=range(4))
+
+    @property
     def all(self) -> List[str]:
-        """All mechanistic kinetic models."""
+        """All mechanistic kinetic models (excludes grid models to avoid duplication)."""
         return [
             'F0', 'F1', 'F2', 'F3',
             'A2', 'A3',
@@ -123,6 +161,25 @@ class _KineticModels:
     def autocatalytic(self) -> List[str]:
         """Autocatalytic models (Sestak-Berggren, Prout-Tompkins)."""
         return ['SB_mn', 'Bna']
+
+    @property
+    def all_with_sb_grid(self) -> List[str]:
+        """
+        All mechanistic models INCLUDING SB grid search (replaces standard models).
+
+        Use this instead of `all` when you want comprehensive mechanistic screening
+        with the SB(m,n) grid replacing F0-F3 with their SB equivalents plus additional
+        autocatalytic models.
+
+        Warning: Returns 20 models (12 standard + 8 unique SB grid).
+        """
+        # Exclude F0, F1, F2, F3 since they're covered by SB grid
+        return [
+            'A2', 'A3',
+            'R2', 'R3',
+            'D2', 'D3',
+            'Bna'
+        ] + self.SB_grid
 
 
 class _ODEModels:
@@ -235,13 +292,24 @@ class _ModelSelector:
     @property
     def all(self) -> List[str]:
         """
-        All available models (kinetic + ODE + empirical + model-free).
+        All available models (kinetic + SB_grid + ODE + empirical + model-free).
 
-        Equivalent to:
-            models.kinetic.all + models.ode.all + models.empirical.all + models.modelfree.all
+        Includes BOTH standard models (F0-F3) AND SB_grid even though they overlap,
+        because users expect 'all' to mean ALL models without hidden exclusions.
+
+        Total: ~180 models including all variants (136 of them SB2_grid).
+
+        Note: Some models are functionally equivalent:
+        - F0 = SB_m0_n0 (zero-order)
+        - F1 = SB_m0_n1 (first-order)
+        - F2 = SB_m0_n2 (second-order)
+        - F3 = SB_m0_n3 (third-order)
         """
         return (
             self.kinetic.all +
+            self.kinetic.SB_grid +
+            self.kinetic.SB2 +
+            self.kinetic.SB2_grid +
             self.ode.all +
             self.empirical.all +
             self.modelfree.all

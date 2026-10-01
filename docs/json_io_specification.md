@@ -124,16 +124,21 @@ results_dict, results_json = auto_model_isothermal_data(..., output_format='both
         "rmse": 0.0091,
         "n_params": 2,
         "n_points": 24,
+        "durbin_watson": 1.92,
+        "is_physically_plausible": true,
+        "plausibility_issues": [],
         "akaike_weight": 0.87
       },
-      "score": 0.9543
+      "n_params": 2,
+      "score": -0.87,
+      "simplicity_penalty": 0.0
     }
   ],
 
   "selected_model": {
     "model_name": "F2_model",
     "rank": 1,
-    "reason": "Top ranked model",
+    "reason": "Strong evidence (Akaike weight = 87.0%)",
     "parameters": {
       "Ea": 95234.5,
       "A": 1.23e12
@@ -197,7 +202,9 @@ results_dict, results_json = auto_model_isothermal_data(..., output_format='both
 ### Field Descriptions
 
 #### `top_models` (array)
-Ranked list of all successfully fitted models.
+The `top_n` highest-ranked models that passed the ranking filters (R² ≥
+`min_r_squared` and physical plausibility, relaxed with a warning if nothing
+passes). Models are ranked by Akaike weight only.
 
 **Fields per model**:
 - `rank` (int): Ranking (1 = best)
@@ -213,15 +220,32 @@ Ranked list of all successfully fitted models.
   - `n_params` (int): Number of fitted parameters
   - `n_points` (int): Number of data points used in the fit
   - `akaike_weight` (float): Probability this model is the best among the candidate
-    set, given AICc (computed jointly across all successfully-fitted models; sums
-    to 1 across `top_models`' underlying candidate set, not just the entries shown)
-- `score` (float): Combined ranking score (0-1, higher is better)
+    set, given AICc (computed jointly across the models that passed the filters;
+    sums to 1 across `top_models`' underlying candidate set, not just the entries shown)
+  - `durbin_watson` (float): Residual autocorrelation statistic (≈2 is ideal)
+  - `is_physically_plausible` (bool or null): Parameter sanity check
+    (A < 1e20 s⁻¹, 5 < Ea < 1000 kJ/mol)
+  - `plausibility_issues` (array of strings or null): Descriptions of any issues
+- `n_params` (int): Number of fitted parameters
+- `score` (float): Negated Akaike weight (`-akaike_weight`); lower is better and
+  determines the rank
+- `simplicity_penalty` (float): Always `0.0`. AIC's 2k term already penalizes
+  complexity; the field is kept for compatibility
+- `filter_warning` (object, rank 1 only, optional): Present when the filters had to
+  be relaxed. `type` is `'no_plausible_models'` (no model passed both R² and
+  plausibility, so R²-passing models were kept) or `'no_good_models'` (no model
+  reached `min_r_squared`, so all were kept), plus a `message`
 
 #### `selected_model` (object)
 The best model selected by the algorithm.
 
 **Fields**: Same as `top_models` entry (with `stats` renamed to `statistics`), plus:
-- `reason` (string): Why this model was selected
+- `reason` (string): Why this model was selected. The selected model is always
+  rank 1; the reason reports the strength of evidence from its Akaike weight:
+  `"Overwhelming evidence (...)"` (≥ 0.90), `"Strong evidence (...)"` (≥ 0.70),
+  `"Substantial support (...)"` (≥ 0.50), otherwise
+  `"Best of N competitive models (...)"`. The same string is also returned as the
+  top-level `selection_reason` in the dict output
 - `physical_sanity_flags` (array of strings): Warnings when a fitted activation
   energy (`Ea`/`Ea1`/`Ea2`/...) falls outside the plausible 30-180 kJ/mol range
   typical for drug degradation kinetics. Empty list if nothing was flagged. A
@@ -237,8 +261,14 @@ Predicted conversion over time at specified temperature.
 **Fields**:
 - `time` (array of floats): Time points in seconds
 - `conversion_mean` (array of floats): Mean predicted conversion (0-1)
-- `conversion_lower` (array of floats): Lower 95% CI (if bootstrap ran)
-- `conversion_upper` (array of floats): Upper 95% CI (if bootstrap ran)
+- `conversion_lower` (array of floats): Lower CI bound (if bootstrap ran)
+- `conversion_upper` (array of floats): Upper CI bound (if bootstrap ran)
+
+With the default `ci_type='two-sided'`, the bounds are equal-tailed bootstrap
+percentiles (2.5th and 97.5th at `confidence_level=0.95`). With
+`ci_type='one-sided'`, the band is (fitted curve, 95th percentile). The ICH Q1E
+bootstrap shelf-life always uses its own one-sided 95% bound, whichever
+`ci_type` is set.
 - `temperature` (float): Prediction temperature in output units
 - `temperature_units` (string): 'K', 'C', or 'F'
 - `temperature_K` (float): Prediction temperature in Kelvin (for compatibility)
@@ -253,8 +283,8 @@ Conversion under variable temperature profile.
 **Fields**:
 - `time` (array of floats): Time points
 - `conversion_mean` (array of floats): Mean conversion at each time
-- `conversion_lower` (array of floats): Lower 95% CI
-- `conversion_upper` (array of floats): Upper 95% CI
+- `conversion_lower` (array of floats): Lower CI bound (same `ci_type` as `predictions`)
+- `conversion_upper` (array of floats): Upper CI bound
 - `temperature` (array of floats): Temperature at each time point
 - `temperature_units` (string): Output temperature units
 - `time_unit` (string): Time units (from `simulate_time_unit`)
@@ -332,13 +362,15 @@ print(f"2-year prediction: {results['predictions']['conversion_mean'][-1]:.1%}")
         "aic": -150.2, "bic": -145.1, "rss": 0.0012, "rmse": 0.0091,
         "n_params": 2, "n_points": 4, "akaike_weight": 0.87
       },
-      "score": 0.954
+      "n_params": 2,
+      "score": -0.87,
+      "simplicity_penalty": 0.0
     }
   ],
   "selected_model": {
     "model_name": "F2_model",
     "rank": 1,
-    "reason": "Top ranked model",
+    "reason": "Strong evidence (Akaike weight = 87.0%)",
     "parameters": {"Ea": 95234, "A": 1.23e12},
     "statistics": {
       "r_squared": 0.9982, "r_squared_adj": 0.9978,
@@ -601,6 +633,10 @@ Before sending data to the API, ensure:
 | **Fast** (3 models, no bootstrap) | 1-3 seconds | Good for real-time APIs |
 | **Standard** (12 default models, 50 bootstrap) | 30-60 seconds | Balanced |
 | **Comprehensive** (12 default + 2 ODE models, 100 bootstrap) | 5-10 minutes | Background processing |
+
+`models.all` (about 173 models, 136 of them from `models.kinetic.SB2_grid`) is much
+slower: each SB2 grid model is ODE-integrated, and the grid alone typically adds
+10-15 minutes. Avoid it for synchronous API calls.
 
 ### Optimization Tips
 

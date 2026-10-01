@@ -104,13 +104,8 @@ class TestRankModelsAdditiveStats:
         assert [item['model_name'] for item in ranked] == ['ABC', 'F2', 'F1']
         assert [item['rank'] for item in ranked] == [1, 2, 3]
 
-    def test_score_weights_parameter_still_respected(self):
-        # Existing public parameter; must still work after the additive change.
+    def test_filters_can_be_disabled(self):
         fits = self._sample_fits()
-        ranked_default = rank_models(fits)
-        ranked_r2_only = rank_models(fits, score_weights={'bic': 0.0, 'r_squared': 1.0, 'rss': 0.0, 'n_params': 0.0})
-        # Both should still be valid, ordered rankings (not asserting they differ,
-        # since ABC also wins on R^2 alone here -- just that the call succeeds and
-        # produces a complete ranking).
-        assert len(ranked_default) == len(ranked_r2_only) == 3
-        assert {item['rank'] for item in ranked_r2_only} == {1, 2, 3}
+        ranked = rank_models(fits, apply_filters=False)
+        assert len(ranked) == 3
+        assert {item['rank'] for item in ranked} == {1, 2, 3}

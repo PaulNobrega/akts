@@ -22,7 +22,7 @@ from scipy.optimize import least_squares, differential_evolution
 from scipy.stats import t as t_dist
 
 from akts.datatypes import KineticDataset, FitResult, PredictionResult, BootstrapResult
-from akts.utils import R_GAS
+from akts.utils import R_GAS, EA_BOUNDS
 
 
 # ============================================================================
@@ -239,7 +239,7 @@ def fit_empirical_global(
     # Default bounds
     if parameter_bounds is None:
         parameter_bounds = {
-            'Ea': (1e3, 500e3),
+            'Ea': EA_BOUNDS,
             'A': (1e-5, 1e20),
             'A_scale': (0.0, 10.0),
             'A_max': (0.0, 10.0),

@@ -34,6 +34,7 @@ def load_data_file(
     file_type: Optional[str] = None,
     heating_rate: Optional[float] = None,
     auto_detect: bool = True,
+    average_replicates: bool = True,
     **kwargs
 ) -> KineticDataset:
     """
@@ -70,6 +71,9 @@ def load_data_file(
         Heating rate in K/s. If None, estimated from data
     auto_detect : bool
         Automatically detect column names if exact names not found (default: True)
+    average_replicates : bool
+        Automatically detect and average replicate measurements at each (time, temperature)
+        combination. Standard deviation is used to weight points in fitting (default: True)
     **kwargs
         Additional arguments passed to pandas read functions
 
@@ -236,11 +240,19 @@ def load_data_file(
     # Clip conversion to [0, 1]
     conversion = np.clip(conversion, 0.0, 1.0)
 
+    # Average replicates if requested (default behavior)
+    weights = None
+    if average_replicates and len(time) > 1:
+        time, temperature, conversion, weights, metadata = _average_replicates(
+            time, temperature, conversion, metadata
+        )
+
     return KineticDataset(
         time=time,
         temperature=temperature,
         conversion=conversion,
         heating_rate=heating_rate,
+        weights=weights,
         metadata=metadata
     )
 
@@ -429,6 +441,136 @@ def _compute_conversion_from_readout(readout: np.ndarray, readout_type: str,
         raise ValueError(f"Unknown readout_type: {readout_type}. Use 'increasing' or 'decreasing'")
 
     return conversion
+
+
+def _average_replicates(
+    time: np.ndarray,
+    temperature: np.ndarray,
+    conversion: np.ndarray,
+    metadata: Dict
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Dict]:
+    """
+    Average replicate measurements at each (time, temperature) combination.
+
+    Replicates are detected when multiple measurements share the same (time, temperature)
+    within floating point tolerance. Standard deviation is used to compute weights for
+    weighted least squares fitting.
+
+    Parameters
+    ----------
+    time : np.ndarray
+        Time values
+    temperature : np.ndarray
+        Temperature values
+    conversion : np.ndarray
+        Conversion values
+    metadata : Dict
+        Metadata dictionary (updated in place)
+
+    Returns
+    -------
+    time_avg : np.ndarray
+        Averaged time values
+    temp_avg : np.ndarray
+        Averaged temperature values
+    conv_avg : np.ndarray
+        Averaged conversion values
+    weights : np.ndarray or None
+        Weights for weighted least squares (1/variance), None if no replicates found
+    metadata : Dict
+        Updated metadata with averaging info
+    """
+    # Create DataFrame for grouping
+    try:
+        import pandas as pd
+    except ImportError:
+        # Pandas already checked in load_data_file, but be defensive
+        return time, temperature, conversion, None, metadata
+
+    # Round time and temperature to avoid floating point issues
+    time_rounded = np.round(time, decimals=6)
+    temp_rounded = np.round(temperature, decimals=3)
+
+    # Create DataFrame
+    df = pd.DataFrame({
+        'time': time,
+        'temperature': temperature,
+        'conversion': conversion,
+        'time_key': time_rounded,
+        'temp_key': temp_rounded
+    })
+
+    # Group by rounded (time, temperature)
+    grouped = df.groupby(['time_key', 'temp_key'], as_index=False).agg({
+        'time': 'mean',
+        'temperature': 'mean',
+        'conversion': ['mean', 'std', 'count']
+    })
+
+    # Flatten multi-level columns
+    grouped.columns = ['_'.join(col).strip('_') for col in grouped.columns.values]
+    grouped.columns = ['time_key', 'temp_key', 'time', 'temperature',
+                      'conversion_mean', 'conversion_std', 'conversion_count']
+
+    # Extract averaged data
+    time_avg = grouped['time'].values
+    temp_avg = grouped['temperature'].values
+    conv_avg = grouped['conversion_mean'].values
+    conv_std = grouped['conversion_std'].values
+    n_replicates = grouped['conversion_count'].values
+
+    # Compute weights for weighted least squares
+    # Weight = 1/variance = 1/(std^2)
+    # For single measurements, use mean variance as default
+    weights = None
+    n_points_before = len(time)
+    n_points_after = len(time_avg)
+    n_replicated = int(np.sum(n_replicates > 1))
+
+    if n_replicated > 0:
+        # Compute weights
+        weights = np.ones_like(conv_avg)
+
+        # For points with replicates: weight = n / std^2
+        # (Include sample size n to properly weight based on precision)
+        mask_replicated = n_replicates > 1
+        stds = conv_std[mask_replicated]
+
+        # Replace NaN std (perfect replicates) with min non-zero std
+        valid_stds = stds[np.isfinite(stds) & (stds > 0)]
+        if len(valid_stds) > 0:
+            min_std = np.min(valid_stds)
+            stds = np.where(np.isfinite(stds) & (stds > 0), stds, min_std)
+        else:
+            # All replicates are identical - use uniform weighting
+            stds = np.ones_like(stds)
+
+        weights[mask_replicated] = n_replicates[mask_replicated] / (stds ** 2)
+
+        # For single measurements: weight = 1 / mean(variance)
+        # This gives them average influence
+        mean_variance = np.mean(stds ** 2)
+        weights[~mask_replicated] = 1.0 / mean_variance if mean_variance > 0 else 1.0
+
+        # Normalize weights to have mean = 1 (optional, helps with interpretation)
+        weights = weights / np.mean(weights)
+
+        metadata['replicates_averaged'] = True
+        metadata['n_points_before_averaging'] = n_points_before
+        metadata['n_points_after_averaging'] = n_points_after
+        metadata['n_replicated_points'] = n_replicated
+        metadata['averaging_method'] = 'mean with inverse-variance weighting'
+    else:
+        # No replicates found
+        metadata['replicates_averaged'] = False
+        if n_points_before != n_points_after:
+            warnings.warn(
+                f"Averaging reduced points from {n_points_before} to {n_points_after} "
+                "but no true replicates (>1 measurement per timepoint) were detected. "
+                "This may indicate near-duplicate timepoints."
+            )
+
+    return time_avg, temp_avg, conv_avg, weights, metadata
 
 
 def _estimate_heating_rate(time: np.ndarray, temperature: np.ndarray) -> float:

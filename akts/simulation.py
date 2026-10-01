@@ -183,7 +183,7 @@ ALPHA_SEED = 1e-6
 def _initial_state(model_name: str, state_dim: int, initial_alpha: float = 0.0) -> np.ndarray:
     if model_name == "A->B->C":
         return np.array([1.0 - initial_alpha, 0.0])
-    if model_name == "single_step":
+    if model_name in ("single_step", "SB2"):
         return np.full(state_dim, max(initial_alpha, ALPHA_SEED))
     return np.full(state_dim, initial_alpha)
 

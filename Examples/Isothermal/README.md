@@ -312,7 +312,7 @@ models_to_try=['F1', 'F2']   # Fewer models
 - **API Reference**: See `docs/api_reference.md`
 - **Model Equations**: See `docs/kinetic_models.md`
 - **Advanced Guide**: See `docs/advanced_usage.md`
-- **ICH Q1E Details**: See `PHASE5_ICH_Q1E_SUMMARY.md`
+- **ICH Q1E Details**: See `docs/ich_q1e_compliance.md`
 
 ---
 

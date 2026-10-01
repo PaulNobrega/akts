@@ -30,8 +30,14 @@ results = auto_model_isothermal_data(
     output_format='dict',          # 'dict', 'json', or 'both'
     bootstrap_iterations=100,
     bootstrap_method='monte_carlo',
+    confidence_level=0.95,
+    ci_type='two-sided',           # Plotted/returned band; 'one-sided' = (MLE, 95th pct)
+    min_r_squared=0.70,            # Ranking filter
+    apply_filters=True,            # R² and plausibility filters before ranking
+    average_replicates=False,      # Keep every replicate point (recommended)
     n_jobs=-1,                     # Bootstrap workers: all but one CPU core
-    progress_callback=None
+    progress_callback=None,
+    **loader_kwargs                # e.g. readout_type='increasing', readout_final=100.0
 )
 ```
 
@@ -42,6 +48,19 @@ temperatures. To include ODE or empirical models, pass a selector list such as
 `models.default + models.ode.all`. See
 [Model-free prediction](#model-free-prediction-no-reaction-model-assumed) below
 and [automated_analysis.md](automated_analysis.md#model-selection) for details.
+
+When several files are loaded, their readouts are converted to conversion on one
+shared scale: `conversion = (readout - readout_initial) / (readout_final - readout_initial)`.
+By default `readout_initial` is the mean first readout across files and
+`readout_final` is the largest observed readout (smallest for
+`readout_type='decreasing'`). Pass either as a loader keyword to override, e.g.
+`readout_final=100.0` for %HMW data scaled as (HMW - HMW0)/(100 - HMW0), the
+commercial AKTS convention.
+
+`average_replicates=False` (the default) keeps every replicate point. With equal
+replicate counts per time point, least squares on replicates gives the same fit as
+on means, and the replicates preserve the scatter that the bootstrap resamples and
+the prediction interval uses.
 
 When `predict` is provided, the report also attempts a shelf-life estimate at
 `shelf_life_temperature_C` (default 20°C), independently of the prediction
@@ -70,7 +89,7 @@ from akts import fit_kinetic_model
 
 fit_result = fit_kinetic_model(
     datasets,                      # List[KineticDataset]
-    model_name,                    # 'single_step', 'A->B->C', 'A+B->C'
+    model_name,                    # 'single_step', 'SB2', 'A->B->C', 'A+B->C'
     model_definition_args,         # See Model Parameters below
     initial_guesses,               # Dict[str, float]
     parameter_bounds=None,
@@ -78,6 +97,11 @@ fit_result = fit_kinetic_model(
     optimizer_options=None,        # e.g. {'method': 'Powell', 'max_seconds': 120}
 )
 ```
+
+Unspecified `Ea` bounds default to `akts.utils.EA_BOUNDS = (5e3, 1000e3)` J/mol,
+the same range used for every `Ea` parameter across single-step, grid, ODE,
+empirical, and bootstrap fits. A warning is issued when a fitted `Ea` sits at a
+bound, since the optimum may lie outside it.
 
 **Model Parameters:**
 
@@ -101,6 +125,15 @@ model_definition_args={'f_alpha_model': 'SB_mnp'}
 initial_guesses={'Ea': 100000, 'A': 1e12, 'm': 0.5, 'n': 1.0, 'p': 0.0}
 parameter_bounds={'m': (0, 3), 'n': (0, 3), 'p': (-2, 2)}
 
+# SB2 (two parallel Sestak-Berggren steps on one conversion, ODE-integrated)
+# dα/dt = k1(T)·α^m1·(1-α)^n1 + k2(T)·α^m2·(1-α)^n2
+model_name='SB2'
+model_definition_args={'sb2_params': {}}  # or {'m1': 0, 'n1': 1, 'm2': 1, 'n2': 3} to fix orders
+initial_guesses={'Ea1': 160000, 'A1': 1e20, 'Ea2': 60000, 'A2': 1e8,
+                 'm1': 0.5, 'n1': 1.0, 'm2': 0.0, 'n2': 1.0}
+parameter_bounds={'A1': (1e-10, 1e200), 'A2': (1e-10, 1e200),
+                  'm1': (0, 3), 'n1': (0, 8), 'm2': (0, 3), 'n2': (0, 8)}
+
 # A->B->C (consecutive)
 model_definition_args={'f1_model': 'F1', 'f2_model': 'F1'}
 initial_guesses={'Ea1': 85000, 'A1': 1e11, 'Ea2': 95000, 'A2': 1e12}
@@ -109,6 +142,16 @@ initial_guesses={'Ea1': 85000, 'A1': 1e11, 'Ea2': 95000, 'A2': 1e12}
 model_definition_args={'bimol_params': {'initial_ratio_r': 1.0, 'm': 1.0, 'n': 1.0}}
 initial_guesses={'Ea': 85000, 'A': 1e11}
 ```
+
+SB2 is fitted with `scipy.optimize.least_squares` (TRF) on the ODE residuals.
+Through `auto_model_isothermal_data()` (`models.kinetic.SB2` or
+`models.kinetic.SB2_grid`), it is started from data-driven Arrhenius estimates
+(zero-order fits of low- and high-conversion datasets, both step orderings) plus
+the default guess, and the fit with the best AIC is kept. The fast step can need
+A around 1e166 s⁻¹ or more, which exceeds the 1e20 s⁻¹ plausibility limit, so a
+"no physically plausible models" ranking warning is expected when SB2 wins; the
+model is still selected. When the two steps are poorly separated in the data, the
+fast step's `Ea1` is poorly identified and can end at the `EA_BOUNDS` limit.
 
 ### run_bootstrap()
 
@@ -207,9 +250,21 @@ time_s, temp_K = construct_profile(segments)
 prediction = predict_conversion(
     kinetic_description=fit_result,
     temperature_program=(time_s, temp_K),
-    bootstrap_result=bootstrap_result  # Optional, adds .conversion_ci
+    bootstrap_result=bootstrap_result,  # Optional, adds .conversion_ci
+    ci_type='two-sided',                # or 'one-sided'
+    attribute_direction='decreasing',   # Used with ci_type='one-sided'
 )
 ```
+
+`ci_type='two-sided'` (default) returns equal-tailed bootstrap percentiles, e.g.
+[2.5th, 97.5th] at 95%; use it for fit, prediction, and simulation plots.
+`ci_type='one-sided'` returns (MLE curve, 95th percentile), the bound used for ICH
+Q1E crossing. `auto_model_isothermal_data()` always computes the one-sided bound
+separately for its bootstrap shelf-life, whatever `ci_type` is set.
+
+Bootstrap replicates whose final predicted conversion is below
+min(1%, 10% of the main prediction's final value) are treated as degenerate and
+excluded from the band, so low-conversion predictions keep their CI.
 
 ### time_to_conversion()
 
@@ -314,6 +369,11 @@ dataset = KineticDataset(
 - `.plausibility_issues` - List[str] (descriptions of parameter issues, if any)
 - `.message` - str
 
+For the top models, `auto_model_isothermal_data()` also attaches per-dataset
+plotting arrays: `.conversion_simulated`, `.conversion_simulated_ci` (bootstrap
+CI band per dataset, or None), and `.conversion_simulated_pi` (95% prediction
+interval per dataset; see [Fit Overlay](#fit-overlay-data-vs-model)).
+
 **`rank_models()` per-model `stats` dict** (used internally by `auto_model_isothermal_data()`
 and returned in its `top_models`/`selected_model` output) includes `rss`, `r_squared`,
 `aic`, `bic`, `n_params`, `n_points`, plus the additive fields `r_squared_adj` (adjusted
@@ -326,6 +386,9 @@ indicates systematic error), `is_physically_plausible` (bool), and `plausibility
 - `.parameter_ci` - Dict[str, Tuple[float, float]]
 - `.median_parameters` - Dict[str, float]
 - `.n_iterations` - int
+
+Replicate refits whose RSS exceeds 10x the median replicate RSS are excluded as
+non-converged, with a warning giving the count.
 
 **PredictionResult attributes:**
 - `.time`, `.temperature`, `.conversion` - np.ndarray
@@ -408,41 +471,81 @@ models_to_try = [
 ranked_models = discover_kinetic_models(
     datasets=datasets,
     models_to_try=models_to_try,
-    initial_guesses_pool={'F1': {...}, 'F2': {...}}
+    initial_guesses_pool={'F1': {...}, 'F2': {...}},
+    parameter_bounds_pool=None,
+    min_r_squared=0.70,   # Passed to rank_models()
+    apply_filters=True
 )
 ```
 
-### Ranking Methods
+### Ranking Method
 
-`rank_models()` supports multiple ranking approaches:
+`rank_models()` uses **Akaike weights exclusively** for optimal model selection:
 
 ```python
 from akts import rank_models
 
-# Combined scoring (default): weighted BIC, R², RSS, n_params
-ranked = rank_models(fit_results, ranking_method='combined')
+# Ranks by Akaike weights (probability each model is best)
+ranked = rank_models(
+    fit_results,
+    min_r_squared=0.70,  # Filter: minimum R² threshold
+    apply_filters=True    # Filter by R² and plausibility
+)
 
-# BIC-only: direct ΔBIC interpretation
-# ΔBIC < 2: weak evidence, 2-6: positive, 6-10: strong, >10: very strong
-ranked = rank_models(fit_results, ranking_method='bic')
-
-# AIC-only: similar to BIC but different penalty
-ranked = rank_models(fit_results, ranking_method='aic')
-
-# Akaike weights: probability each model is best (sums to 1)
-ranked = rank_models(fit_results, ranking_method='akaike_weight')
-
-# R² only: maximize explained variance
-ranked = rank_models(fit_results, ranking_method='r_squared')
+# Access results
+for model in ranked[:3]:  # Top 3
+    print(f"{model['rank']}. {model['model_name']}")
+    print(f"   Akaike weight: {model['stats']['akaike_weight']:.1%}")
+    print(f"   R²: {model['stats']['r_squared']:.3f}")
+    print(f"   Plausible: {model['stats']['is_physically_plausible']}")
 ```
 
-**When to use each method:**
-- **BIC/AIC**: Most interpretable for model comparison (prefer BIC for n>40)
-- **Akaike weight**: Multi-model inference, model averaging
-- **Combined**: Balances multiple criteria (default)
-- **R²**: Maximize explanatory power (ignores model complexity)
+The former `ranking_method` and `score_weights` arguments have been removed;
+passing them raises `TypeError`. There is no extra simplicity penalty (the
+`simplicity_penalty` field is always 0.0): AIC's 2k term already penalizes
+complexity.
+
+**Filters** (when `apply_filters=True`):
+1. Keep models with R² ≥ `min_r_squared` that are physically plausible
+   (A < 1e20 s⁻¹, 5 < Ea < 1000 kJ/mol).
+2. If none qualify, keep models with R² ≥ `min_r_squared` and attach a
+   `filter_warning` of type `'no_plausible_models'` to rank 1.
+3. If none reach `min_r_squared`, keep all models with a `'no_good_models'` warning.
+
+`auto_model_isothermal_data()` selects rank 1. Its `reason` reports the Akaike
+weight: "Overwhelming evidence" (≥ 0.90), "Strong evidence" (≥ 0.70),
+"Substantial support" (≥ 0.50), otherwise "Best of N competitive models".
+
+**Why Akaike weights?**
+- Suited to prediction
+- Balances fit quality and complexity through AIC
+- Provides a probability interpretation
+- Standard statistical practice
+
+**Akaike weight interpretation:**
+- **≥ 90%**: Overwhelming evidence for this model
+- **70-90%**: Strong evidence
+- **50-70%**: Substantial support, consider alternatives
+- **< 50%**: Model uncertainty exists; compare the competitive models
+
+See [Model Selection Guide](model_selection.md) for complete details.
 
 ## Utilities
+
+### Model Name Generators
+
+```python
+from akts import generate_sb_grid_models, generate_sb2_grid_models
+from akts.models import parse_sb2_model
+
+generate_sb2_grid_models()              # 136 names, m_range=range(4), n_range=range(4)
+# ['SB2_m0n0_m0n0', 'SB2_m0n0_m0n1', ...]: every unordered pair of integer SB steps
+parse_sb2_model('SB2_m0n1_m1n3_model')  # (0, 1, 1, 3), or None if not an SB2 grid name
+```
+
+Each SB2 grid model fixes (m1, n1, m2, n2) and fits only Ea1, A1, Ea2, A2. The same
+list is available as `models.kinetic.SB2_grid`; the fully fitted two-step model is
+`models.kinetic.SB2`. Both are part of `models.all`.
 
 ### Temperature Profile Builder
 
@@ -518,9 +621,18 @@ from akts import plot_fit_overlay, predict_conversion
 # Plot experimental data with model prediction
 prediction = predict_conversion(fit_result, lambda t: 298.15,
                                simulation_time_sec=np.linspace(0, 7200, 100))
-fig = plot_fit_overlay(datasets, fit_result, prediction=prediction, time_units='hours')
+fig = plot_fit_overlay(datasets, fit_result, prediction=prediction, time_units='hours',
+                       show_ci=True, show_pi=True)
 fig.savefig('fit_overlay.png')
 ```
+
+`prediction` may be a list with one `PredictionResult` per dataset. With
+`show_pi=True` (default) a lighter 95% prediction interval (PI) is shaded behind
+the darker 95% CI. PI half-width = t·sqrt(se_fit² + s_i²), where s_i² is that
+dataset's residual variance (degrees of freedom pooled across datasets) and se_fit
+comes from the bootstrap CI half-width. About 95% of data points should fall inside
+the PI. The CI covers curve uncertainty only, so data scattering outside the CI is
+expected.
 
 ### Bootstrap Confidence Intervals
 

@@ -2,6 +2,8 @@
 
 How to choose the right kinetic model for your system.
 
+> **Note:** This guide covers **which models to try**. For how models are **ranked and selected**, see the [Model Selection](model_selection.md) guide (Akaike weights, filters, plausibility).
+
 ## Quick Decision Tree
 
 ```
@@ -170,6 +172,12 @@ results = auto_model_isothermal_data(
 - **Characteristics:** `α^c·(1-α)` (fixed c=1.0 in akts) — sigmoidal, similar in shape to Avrami-Erofeev but derived differently
 - **Examples:** Self-accelerating solid-state decomposition, autocatalytic drug degradation
 
+**SB2 (two-step Sestak-Berggren)**
+- **When to use:** Two processes acting on one conversion, for example a slow low-temperature process plus a steep high-temperature one (the AKTS commercial two-step form)
+- **Equation:** dα/dt = k1(T)·α^m1·(1-α)^n1 + k2(T)·α^m2·(1-α)^n2
+- **Variants:** `SB2` fits Ea1, A1, Ea2, A2, m1, n1, m2, n2 (8 parameters); `SB2_grid` is 136 models with integer m, n fixed and only Ea1, A1, Ea2, A2 fitted
+- **Caveats:** ODE-integrated and slow; the fast step's A is usually far above 10²⁰ s⁻¹, so SB2 is filtered out when any plausible model reaches the R² threshold, and the plausibility warning appears whenever SB2 is selected. See [SB grid search](SB_GRID_SEARCH.md#two-step-sestak-berggren-sb2).
+
 [Kinetic models guide](kinetic_models.md) provides the full equations.
 
 ## Selection Strategy
@@ -186,7 +194,7 @@ results = auto_model_isothermal_data(
 
 print(f"Top 3 models:")
 for model in results['top_models'][:3]:
-    print(f"  {model['model_name']}: R² = {model['statistics']['r_squared']:.4f}")
+    print(f"  {model['model_name']}: R² = {model['stats']['r_squared']:.4f}")
 ```
 
 ### Step 2: Interpret Results
@@ -202,25 +210,20 @@ for model in results['top_models'][:3]:
 - Check for multi-phase degradation
 
 **If multiple models fit similarly:**
-- Use BIC to select (penalizes complexity)
-- Prefer simpler models (F1 over F2 over A2)
-- Check physical meaning
-- **Note:** `auto_model_isothermal_data()` already does this automatically — see "How akts Picks the Winning Model" below
+- Look at the Akaike weights of the top models: several with weight > 10% means the data do not clearly separate them
+- Check physical meaning and parameter plausibility
+- Consider collecting data that discriminates between them (more temperatures, higher conversion)
 
 ### How akts Picks the Winning Model
 
-The models in `results['top_models']` are ranked by a weighted combined score (BIC, R², RSS, and parameter count — see "Combined Score" below), but `results['selected_model']` is **not** always simply the top-ranked-by-score model. Instead, `auto_model_isothermal_data()`:
+`auto_model_isothermal_data()` filters the fitted models (R² ≥ `min_r_squared`, default 0.70, and physically plausible, with fallbacks described in [Model Selection](model_selection.md)), ranks the survivors by Akaike weight, and selects the rank-1 model. There is no ΔBIC or ΔAIC tie-break toward simpler models: the 2k term in AIC already penalizes complexity.
 
-1. Finds every fitted model whose BIC is within 2 of the best BIC in the candidate set. A ΔBIC this small means the data can't statistically distinguish between these models (Kass & Raftery, 1995) — the extra complexity of one over another isn't justified.
-2. Among that statistically-tied group, picks the **simplest** one: fewest fitted parameters, with a fixed tie-break order among models with equal parameter counts (F1, F2, F3, R2, R3, A2, A3, D2, D3, D4, then the ODE models).
+`results['selected_model']['reason']` states the evidence, e.g.:
+- `"Overwhelming evidence (Akaike weight = 97.3%)"` (weight ≥ 90%)
+- `"Strong evidence (...)"` (≥ 70%) or `"Substantial support (...)"` (≥ 50%)
+- `"Best of 3 competitive models (Akaike weight = 41.0%)"` — model uncertainty; inspect `results['top_models']`
 
-`results['selected_model']['reason']` explains what happened, e.g.:
-- `"Simplest of 3 statistically indistinguishable models (ΔBIC < 2): F1, F2, A2"` — F1 was chosen because it's the simplest of three models that fit equally well statistically.
-- `"Best BIC; no other model is statistically equivalent"` — the top-BIC model was a clear winner, no tie-break needed.
-
-This automates the "prefer simpler models when they fit similarly" advice above — you generally don't need to do this comparison by hand.
-
-`results['selected_model']['physical_sanity_flags']` is also worth checking: it lists warnings (not exclusions) when a fitted `Ea` falls outside the ~30-180 kJ/mol range typical for drug degradation kinetics (see "Check parameter values" below) — an automatic version of that manual sanity check. A flagged fit isn't necessarily wrong (diffusion-limited or unusually stable formulations can genuinely fall outside this range), but it's worth a second look.
+`results['selected_model']['physical_sanity_flags']` is also worth checking: it lists warnings (not exclusions) when a fitted `Ea` falls outside the ~30-180 kJ/mol range typical for drug degradation kinetics (see "Check parameter values" below) — an automatic version of that manual sanity check. This is separate from the plausibility filter, which only rejects Ea outside 5-1000 kJ/mol or A ≥ 10²⁰ s⁻¹. A flagged fit isn't necessarily wrong (diffusion-limited or unusually stable formulations can genuinely fall outside this range), but it's worth a second look.
 
 ### Step 3: Validate Choice
 
@@ -237,7 +240,8 @@ This automates the "prefer simpler models when they fit similarly" advice above 
 **Check parameter values:**
 - Ea = 40-150 kJ/mol (typical)
 - Ea < 40 kJ/mol = diffusion-limited
-- Ea > 150 kJ/mol = suspect (check units!)
+- Ea > 150 kJ/mol = suspect for small-molecule degradation (check units); protein unfolding/denaturation is typically 400-800 kJ/mol
+- Ea at 5 or 1000 kJ/mol = at the fitting bound; `fit_kinetic_model` warns, and the true optimum may lie outside
 - `auto_model_isothermal_data()` flags this automatically in `results['selected_model']['physical_sanity_flags']` (using a slightly wider 30-180 kJ/mol plausible range) — see "How akts Picks the Winning Model" above
 
 ## Application-Specific Guidance
@@ -292,7 +296,7 @@ ODE models:
 
 ### Check physical plausibility
 
-Example: Ea = 300 kJ/mol is unrealistic for most reactions
+Example: Ea = 300 kJ/mol is unusual for small-molecule chemical degradation, but not for protein unfolding. Judge Ea against the process you expect.
 
 ### Use diffusion models with supporting evidence
 
@@ -319,23 +323,19 @@ Diffusion models rarely apply to:
 - Penalizes additional parameters
 - Use for comparing models with different parameters
 
+- akts uses the small-sample corrected AICc
+
+### Akaike Weight
+
+- w_i = exp(-0.5·ΔAICc_i) / Σ exp(-0.5·ΔAICc_j)
+- Probability that a model is the best in the candidate set; weights sum to 1
+- **akts ranks models by Akaike weight only** (after the R² and plausibility filters)
+
 ### BIC (Bayesian Information Criterion)
 
 - Lower is better
 - Penalizes parameters more than AIC
-- Preferred for model selection (favors simpler models)
-
-### Combined Score
-
-akts uses weighted combination:
-```python
-score = w_BIC * (1 - normalized_BIC) +
-        w_R2 * normalized_R2 +
-        w_RSS * (1 - normalized_RSS) +
-        w_params * (1 - normalized_n_params)
-```
-
-**Result:** Higher score = better model
+- Reported for reference; not used for ranking
 
 ## Advanced: Custom Model Selection
 
@@ -355,7 +355,9 @@ ranked = discover_kinetic_models(
     datasets=datasets,
     models_to_try=models_to_try,
     initial_guesses_pool={...},
-    parameter_bounds_pool={...}
+    parameter_bounds_pool={...},
+    min_r_squared=0.70,   # R² filter (default)
+    apply_filters=True    # R² and plausibility filters (default)
 )
 ```
 
@@ -370,7 +372,7 @@ Before finalizing model choice:
 - [ ] Verified Arrhenius plot is linear?
 - [ ] Confirmed residuals are random?
 - [ ] Checked parameters are physically reasonable?
-- [ ] Used simplest model that fits well?
+- [ ] Checked the Akaike weight (low weight = model uncertainty)?
 - [ ] Only used ODE models if necessary (R² < 0.8 for simple models)?
 - [ ] Validated with independent data (if available)?
 

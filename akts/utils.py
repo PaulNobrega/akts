@@ -7,6 +7,7 @@ from typing import Callable, Dict, List, Tuple, Any
 
 # Ideal gas constant (J/mol·K)
 R_GAS = 8.31446261815324
+EA_BOUNDS = (5e3, 1000e3)  # J/mol, fitting search range for every Ea parameter
 
 # --- Canonical time-unit-to-seconds conversions ---
 # Single source of truth for "month"/"year" as seconds -- other modules
@@ -379,7 +380,7 @@ def check_physical_plausibility(parameters: Dict[str, float],
     Check if fitted kinetic parameters are physically plausible.
 
     Flags parameters that fall outside typical ranges for solid-state/solution kinetics:
-    - Ea (activation energy): 30-180 kJ/mol typical, 10-400 kJ/mol absolute
+    - Ea (activation energy): 30-180 kJ/mol typical, 5-1000 kJ/mol absolute
     - A (pre-exponential): 10^6 to 10^18 s^-1 typical, 10^-2 to 10^25 absolute
 
     Parameters
@@ -404,11 +405,11 @@ def check_physical_plausibility(parameters: Dict[str, float],
     - A: 10^6 to 10^18 s^-1
 
     Absolute ranges (strict=False):
-    - Ea: 10-400 kJ/mol (catches clearly unphysical values only)
+    - Ea: 5-1000 kJ/mol, same as EA_BOUNDS (catches clearly unphysical values only)
     - A: 10^-2 to 10^25 s^-1
 
-    Very low Ea (<10 kJ/mol) suggests diffusion-limited or barrierless processes.
-    Very high Ea (>400 kJ/mol) is uncommon except for bond-breaking reactions.
+    Very low Ea (<5 kJ/mol) suggests diffusion-limited or barrierless processes.
+    Ea of 400-800 kJ/mol is typical of cooperative protein unfolding.
     Very low A (<0.1 s^-1) suggests highly ordered transition states.
     Very high A (>10^25 s^-1) exceeds molecular collision frequencies.
 
@@ -424,7 +425,7 @@ def check_physical_plausibility(parameters: Dict[str, float],
         Ea_min, Ea_max = 30e3, 180e3  # 30-180 kJ/mol typical
         A_min, A_max = 1e6, 1e18       # Typical pre-exponential range
     else:
-        Ea_min, Ea_max = 10e3, 400e3  # 10-400 kJ/mol absolute
+        Ea_min, Ea_max = EA_BOUNDS
         A_min, A_max = 1e-2, 1e25      # Very permissive range
 
     for p_name, p_val in parameters.items():

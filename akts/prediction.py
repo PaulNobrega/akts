@@ -116,14 +116,60 @@ def _ci_from_replicate_curves(
     curves: np.ndarray,
     confidence_level: float,
     label: str = "",
+    attribute_direction: str = 'decreasing',
+    ci_type: str = 'two-sided',
+    main_prediction: Optional[np.ndarray] = None,
 ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """Percentile CI band from an (n_replicates, n_times) array of conversion curves.
+    """
+    Percentile CI band from an (n_replicates, n_times) array of conversion curves.
+
+    Supports both two-sided CI bands (for prediction plots) and one-sided bounds
+    (for regulatory shelf-life determination per ICH Q1E).
 
     Replicates with a non-finite or < DEGENERATE_FINAL_CONVERSION final value are
     dropped when at least MIN_VALID_REPLICATES_FOR_CI replicates remain; otherwise
     all replicates are used and a warning is issued. Returns None if no replicate
     produced a finite curve.
+
+    Parameters
+    ----------
+    curves : np.ndarray
+        (n_replicates, n_times) array of conversion curves
+    confidence_level : float
+        Confidence level (e.g., 0.95)
+    label : str
+        Label prefix for warnings
+    attribute_direction : str
+        For ci_type='one-sided': 'decreasing' or 'increasing' (both use 95th percentile)
+        For ci_type='two-sided': not used (symmetric bands)
+    ci_type : str, default 'two-sided'
+        'two-sided': Returns [2.5th, 97.5th] percentiles for 95% CI (for plotting)
+        'one-sided': Returns [main prediction, 95th] percentile (for ICH Q1E regulatory)
+    main_prediction : np.ndarray, optional
+        The main prediction (MLE fit) to use as lower bound for one-sided CI.
+        If None, uses bootstrap mean as fallback.
+
+    Returns
+    -------
+    (lower, upper) : tuple of np.ndarray
+        If ci_type='two-sided': (2.5th percentile, 97.5th percentile) for 95% CI
+        If ci_type='one-sided': (mean, 95th percentile) - conservative for ICH Q1E
+
+    Notes
+    -----
+    **Two-sided CI (ci_type='two-sided', default):**
+    - Shows full uncertainty around the mean for prediction plots
+    - Symmetric percentile bands: [2.5%, 97.5%] for 95% confidence
+    - Appropriate for visualizing bootstrap uncertainty
+
+    **One-sided bounds (ci_type='one-sided'):**
+    - ICH Q1E-compliant regulatory shelf-life determination
+    - Conservative estimate using 95th percentile (fastest degradation)
+    - Both 'decreasing' and 'increasing' attributes use upper 95th percentile
+    - Gives shorter (conservative) shelf-life estimates
     """
+    if attribute_direction not in ('decreasing', 'increasing'):
+        raise ValueError(f"attribute_direction must be 'decreasing' or 'increasing', got '{attribute_direction}'")
     prefix = f"{label}: " if label else ""
     curves = np.asarray(curves, dtype=float)
     if curves.ndim != 2 or curves.size == 0 or not np.any(np.isfinite(curves)):
@@ -136,11 +182,14 @@ def _ci_from_replicate_curves(
         warnings.warn(f"{prefix}Only {n_successful}/{n_total} bootstrap simulations succeeded. CI may be unreliable.")
 
     final_conversions = curves[:, -1]
-    valid_mask = np.isfinite(final_conversions) & (final_conversions >= DEGENERATE_FINAL_CONVERSION)
+    threshold = DEGENERATE_FINAL_CONVERSION
+    if main_prediction is not None and np.isfinite(main_prediction[-1]):
+        threshold = min(threshold, 0.1 * float(main_prediction[-1]))
+    valid_mask = np.isfinite(final_conversions) & (final_conversions >= threshold)
     n_valid = int(np.sum(valid_mask))
     if n_valid < n_total:
         warnings.warn(f"{prefix}Filtered {n_total - n_valid}/{n_total} degenerate bootstrap samples "
-                      f"(final conversion < {DEGENERATE_FINAL_CONVERSION:.0%}). "
+                      f"(final conversion < {threshold:.2%}). "
                       f"CI calculation uses {n_valid} valid samples.")
     if n_valid >= MIN_VALID_REPLICATES_FOR_CI:
         used = curves[valid_mask, :]
@@ -148,11 +197,31 @@ def _ci_from_replicate_curves(
         warnings.warn(f"{prefix}Only {n_valid} valid bootstrap samples - CI may be unreliable.")
         used = curves
 
-    tail = (1.0 - confidence_level) / 2.0
+    # Calculate confidence bands based on ci_type
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
-        lower = np.nanpercentile(used, tail * 100.0, axis=0)
-        upper = np.nanpercentile(used, (1.0 - tail) * 100.0, axis=0)
+        mean = np.nanmean(used, axis=0)
+
+        if ci_type == 'two-sided':
+            # Two-sided CI: symmetric percentiles around the mean
+            # For 95% CI: [2.5th percentile, 97.5th percentile]
+            # Appropriate for prediction plots showing full uncertainty
+            tail = (1.0 - confidence_level) / 2.0  # For 95% CI: 2.5% tails
+            lower = np.nanpercentile(used, tail * 100.0, axis=0)  # 2.5th percentile
+            upper = np.nanpercentile(used, (1.0 - tail) * 100.0, axis=0)  # 97.5th percentile
+        elif ci_type == 'one-sided':
+            # One-sided bound: conservative for ICH Q1E regulatory shelf-life
+            # For 95% confidence: [main prediction, 95th percentile]
+            # 95th percentile represents fastest degradation (conservative)
+            # IMPORTANT: Use main_prediction (MLE fit), not bootstrap mean, as lower bound
+            if main_prediction is not None:
+                lower = main_prediction  # Use the actual MLE prediction
+            else:
+                lower = mean  # Fallback to bootstrap mean if main not provided
+            upper = np.nanpercentile(used, confidence_level * 100.0, axis=0)  # 95th percentile
+        else:
+            raise ValueError(f"ci_type must be 'two-sided' or 'one-sided', got '{ci_type}'")
+
     if np.all(lower == 0) and np.max(upper) > 0:
         warnings.warn(f"{prefix}Lower CI bound is all zeros - bootstrap may have insufficient variation or failures.")
     return lower, upper
@@ -169,8 +238,41 @@ def predict_conversion(
     initial_alpha: float = 0.0,
     solver_options: Optional[Dict] = None,
     bootstrap_result: Optional[BootstrapResult] = None,
+    attribute_direction: str = 'decreasing',
+    ci_type: str = 'two-sided',
 ) -> PredictionResult:
-    """Predicts conversion using fitted parameters. Calculates CI if bootstrap results provided."""
+    """
+    Predicts conversion using fitted parameters. Calculates CI if bootstrap results provided.
+
+    Parameters
+    ----------
+    kinetic_description : FitResult or IsoResult
+        Fitted kinetic model or isoconversional result
+    temperature_program : Callable or tuple
+        Temperature program for prediction
+    simulation_time_sec : np.ndarray, optional
+        Time points for evaluation
+    initial_alpha : float, default 0.0
+        Initial conversion
+    solver_options : dict, optional
+        ODE solver options
+    bootstrap_result : BootstrapResult, optional
+        Bootstrap result for confidence interval calculation
+    attribute_direction : str, default 'decreasing'
+        'decreasing' for potency/monomer
+        'increasing' for aggregates/impurities
+        Used with ci_type='one-sided'.
+    ci_type : str, default 'two-sided'
+        'two-sided': equal-tailed percentile band, e.g. [2.5th, 97.5th] at 95%.
+            Use for fit and prediction plots.
+        'one-sided': (MLE curve, 95th percentile) at 95%. Use for ICH Q1E
+            shelf-life crossing; helpers requests this explicitly for that calculation.
+
+    Returns
+    -------
+    PredictionResult
+        Prediction with mean and (if bootstrap provided) confidence bounds.
+    """
     if isinstance(kinetic_description, IsoResult):
         if kinetic_description.Ea is not None and kinetic_description.ln_A_f_alpha is not None:
             return predict_conversion_model_free(
@@ -223,7 +325,9 @@ def predict_conversion(
                     warnings.warn(f"Friedman bootstrap replicate prediction failed: {e_boot}")
             if replicate_alphas:
                 base_prediction.conversion_ci = _ci_from_replicate_curves(
-                    np.array(replicate_alphas), bootstrap_result.confidence_level, label="Friedman")
+                    np.array(replicate_alphas), bootstrap_result.confidence_level,
+                    label="Friedman", attribute_direction=attribute_direction, ci_type=ci_type,
+                    main_prediction=base_prediction.conversion)
         return base_prediction
 
     model_definition_args = getattr(fit_result, 'model_definition_args', None)
@@ -261,6 +365,8 @@ def predict_conversion(
                         curves[i, :] = boot_pred.conversion
                 except Exception as e_boot_sim:
                     warnings.warn(f"Sim failed for bootstrap replicate {i}: {e_boot_sim}")
-            base_prediction.conversion_ci = _ci_from_replicate_curves(curves, bootstrap_result.confidence_level)
+            base_prediction.conversion_ci = _ci_from_replicate_curves(
+                curves, bootstrap_result.confidence_level, attribute_direction=attribute_direction, ci_type=ci_type,
+                main_prediction=base_prediction.conversion)
 
     return base_prediction

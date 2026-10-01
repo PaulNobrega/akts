@@ -73,7 +73,8 @@ def create_regulatory_shelf_life_plot(
             ci_upper_pct,
             alpha=0.3,
             color='#2c7fb8',
-            label=f'{confidence_band_level*100:.0f}% Confidence Interval'
+            # A two-sided (2c-1) band's edges are one-sided c limits, e.g. 90% band -> one-sided 95% limits.
+            label=f'One-sided {(1.0 + confidence_band_level) / 2.0 * 100:.0f}% confidence limits'
         )
         ax.plot(time_months, ci_lower_pct, color='#075985', linestyle='--', linewidth=1.0,
                 alpha=0.9, label='_nolegend_')

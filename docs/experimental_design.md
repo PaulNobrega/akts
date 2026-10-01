@@ -276,6 +276,21 @@ Mass loss range: 5-95%
 - Tests true variability
 - Recommended: n=3
 
+**Replicates in AKTS:** `auto_model_isothermal_data()` keeps every replicate
+point by default (`average_replicates=False`). With the same number of
+replicates at each time point, least squares on the replicates gives the same
+fit as on the means, while the replicates keep the scatter that the bootstrap
+resamples and the prediction interval uses. Fitting on averages but
+bootstrapping on replicates is inconsistent and not recommended.
+
+**Low-conversion temperatures:** Refrigerated series often stay below a few
+percent conversion. Their bootstrap bands are then narrow in absolute terms;
+the report plots each temperature in its own panel with its own y-scale so the
+bands stay visible. A low-conversion series still contributes to the Arrhenius
+fit, but it constrains a steep high-temperature step (for example in SB2) only
+weakly, so include at least one temperature that reaches substantial
+conversion.
+
 ### Sample Size Calculation
 
 For target parameter uncertainty of ±10%:
@@ -309,6 +324,13 @@ For ±5%: n ≈ 400 samples total
 Long-term: 25°C/60% RH for 12 months (minimum 3 timepoints)
 Accelerated: 40°C/75% RH for 6 months (minimum 3 timepoints)
 ```
+
+**Readout scaling:** For a readout such as %HMW that is converted to
+conversion, fix the scale explicitly when comparing with other tools. The
+commercial AKTS scaling is `readout_final=100`, i.e. conversion =
+(HMW - HMW0)/(100 - HMW0). Without it, AKTS uses the mean first readout as the
+start and the maximum observed readout (minimum for decreasing readouts) as the end,
+shared across all files.
 
 **Kinetic enhancement:**
 ```

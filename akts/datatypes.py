@@ -11,6 +11,7 @@ class KineticDataset:
     conversion: np.ndarray
     heating_rate: Optional[float] = None
     relative_humidity: Optional[np.ndarray] = None  # RH in range [0, 1] for humidity-dependent kinetics
+    weights: Optional[np.ndarray] = None  # Weights for weighted least squares (1/variance)
     metadata: Dict = field(default_factory=dict)
 
 @dataclass

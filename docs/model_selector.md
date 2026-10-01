@@ -43,7 +43,16 @@ models.kinetic.SB_mn     # ['SB_mn'] - Sestak-Berggren
 models.kinetic.Bna       # ['Bna'] - Prout-Tompkins
 
 # All kinetic models
-models.kinetic.all       # All 12 models
+models.kinetic.all       # All 12 models (no grid or SB2 models)
+
+# Sestak-Berggren variants (not in models.kinetic.all)
+models.kinetic.SB        # ['SB'] - fitted m, n
+models.kinetic.SB_grid   # 16 models 'SB_m{m}_n{n}', integer m, n in 0-3
+models.kinetic.all_with_sb_grid  # 23 models: kinetic.all without F0-F3 and SB_mn, plus SB_grid
+
+# Two-step Sestak-Berggren (ODE-integrated, slow)
+models.kinetic.SB2       # ['SB2'] - fits Ea1, A1, Ea2, A2, m1, n1, m2, n2
+models.kinetic.SB2_grid  # 136 models 'SB2_m{m1}n{n1}_m{m2}n{n2}', fits Ea1, A1, Ea2, A2
 
 # Sub-categories
 models.kinetic.nth_order      # ['F0', 'F1', 'F2', 'F3']
@@ -102,8 +111,13 @@ conversion ranges.
 ## All Models
 
 ```python
-models.all  # Everything: kinetic + empirical + ODE + model-free
+models.all  # Everything: kinetic + SB_grid + SB2 + SB2_grid + ODE + empirical + model-free
 ```
+
+`models.all` contains 173 models: 12 kinetic, 16 SB_grid, SB2, 136 SB2_grid,
+2 ODE, 5 empirical, and Friedman. The SB2 models are ODE-integrated, so a
+`models.all` run is much slower than one with `models.default`; SB2_grid alone
+adds roughly 10-15 minutes. F0-F3 duplicate SB_m0_n0 to SB_m0_n3.
 
 ---
 
@@ -199,10 +213,23 @@ results = auto_model_isothermal_data(
 # Try all available models
 results = auto_model_isothermal_data(
     data_files=files,
-    models_to_try=models.all,  # All models
+    models_to_try=models.all,  # All 173 models, including the slow SB2_grid
     ...
 )
 ```
+
+### Example 6: Two-Step Sestak-Berggren
+
+```python
+# Continuous SB2 plus the integer SB2 grid
+results = auto_model_isothermal_data(
+    data_files=files,
+    models_to_try=models.kinetic.SB2 + models.kinetic.SB2_grid,
+    ...
+)
+```
+
+See [SB grid search](SB_GRID_SEARCH.md#two-step-sestak-berggren-sb2) for details.
 
 ---
 

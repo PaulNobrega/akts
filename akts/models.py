@@ -144,6 +144,51 @@ def f_sb_mn(alpha: float, params: Dict = {'m': 0.5, 'n': 1.0}) -> float:
     n = params.get('n', 1.0)
     return _f_sb_mn_jit(alpha, m, n)
 
+def generate_sb_grid_models(m_range=range(4), n_range=range(4)):
+    """
+    Generate a grid of SB models with fixed integer m,n values.
+
+    This is recommended over fitting m,n continuously because:
+    1. Integer values correspond to actual mechanistic interpretations
+    2. Prevents overfitting to noise
+    3. More interpretable results
+    4. Efficiently samples the practical parameter space
+
+    Parameters
+    ----------
+    m_range : range or iterable
+        Range of m values to include (default: 0-3)
+    n_range : range or iterable
+        Range of n values to include (default: 0-3)
+
+    Returns
+    -------
+    List[str]
+        List of model names like ['SB_m0_n0', 'SB_m0_n1', ...]
+
+    Examples
+    --------
+    >>> from akts import models
+    >>> sb_grid = generate_sb_grid_models()  # All integer m,n in [0,3]
+    >>> len(sb_grid)
+    16
+    >>> sb_grid[:3]
+    ['SB_m0_n0', 'SB_m0_n1', 'SB_m0_n2']
+
+    Notes
+    -----
+    Common mechanistic interpretations:
+    - SB_m0_n1: First-order (F1)
+    - SB_m0_n2: Second-order (F2)
+    - SB_m1_n0: Power law/autocatalytic
+    - SB_m0_n0: Zero-order (F0)
+    """
+    models = []
+    for m in m_range:
+        for n in n_range:
+            models.append(f'SB_m{m}_n{n}')
+    return models
+
 @njit(cache=True, fastmath=True)
 def _f_sb_mnp_jit(alpha: float, m: float, n: float, p: float) -> float:
     """Extended Sestak-Berggren SB(m,n,p): α^m · (1-α)^n · [-ln(1-α)]^p"""
@@ -246,12 +291,26 @@ MODEL_DISPLAY_NAMES = {
     'A+B->C': 'A+B->C (bimolecular)',
     # Model-free (isoconversional)
     'Friedman': 'Friedman (model-free isoconversional)',
+    'SB2': 'SB2 (two-step Sestak-Berggren, fitted m1,n1,m2,n2)',
 }
 
 
 def model_display_name(model_name: str) -> str:
     """'F1_model' / 'F1' -> 'F1 (first-order)'; unknown names are returned without the _model suffix."""
+    import re
     base = model_name.replace('_model', '')
+
+    sb2 = parse_sb2_model(base)
+    if sb2:
+        return f'SB2(m1={sb2[0]}, n1={sb2[1]}; m2={sb2[2]}, n2={sb2[3]}) (two-step Sestak-Berggren)'
+
+    # Check if it's a grid SB model
+    sb_match = re.match(r'SB_m(\d+)_n(\d+)', base)
+    if sb_match:
+        m_val = sb_match.group(1)
+        n_val = sb_match.group(2)
+        return f'SB(m={m_val}, n={n_val}) (Sestak-Berggren)'
+
     return MODEL_DISPLAY_NAMES.get(base, base)
 
 
@@ -506,6 +565,42 @@ def ode_system_parallel_competing(t: float, y: np.ndarray, T_func: Callable, par
 
     return np.array([dalpha1_dt, dalpha2_dt])
 
+def ode_system_sb2(t: float, y: np.ndarray, T_func: Callable, params: Dict) -> np.ndarray:
+    """Two parallel Sestak-Berggren reactions on one conversion (AKTS two-step form):
+    dα/dt = k1·α^m1·(1-α)^n1 + k2·α^m2·(1-α)^n2."""
+    alpha = y[0]
+    if alpha >= 1.0 - 1e-9:
+        return np.array([0.0])
+    T = T_func(t)
+    if T <= 0:
+        return np.array([0.0])
+    exp1 = -params['Ea1'] / (R_GAS * T)
+    exp2 = -params['Ea2'] / (R_GAS * T)
+    k1 = params['A1'] * np.exp(exp1) if exp1 > -700 else 0.0
+    k2 = params['A2'] * np.exp(exp2) if exp2 > -700 else 0.0
+    a = max(alpha, 0.0)
+    rate = (k1 * _f_sb_mn_jit(a, params['m1'], params['n1'])
+            + k2 * _f_sb_mn_jit(a, params['m2'], params['n2']))
+    return np.array([rate if np.isfinite(rate) and rate > 0.0 else 0.0])
+
+
+def generate_sb2_grid_models(m_range=range(4), n_range=range(4)) -> List[str]:
+    """Two-step SB grid: every unordered pair of SB_m{m}_n{n} steps, e.g. 'SB2_m0n1_m1n3'.
+
+    Steps are exchangeable (the sum is symmetric), so each pair appears once.
+    Steps with m>0 need nonzero conversion to start, which the other step provides.
+    """
+    steps = [(m, n) for m in m_range for n in n_range]
+    return [f'SB2_m{a[0]}n{a[1]}_m{b[0]}n{b[1]}'
+            for i, a in enumerate(steps) for b in steps[i:]]
+
+
+def parse_sb2_model(name: str) -> Optional[Tuple[int, int, int, int]]:
+    import re
+    match = re.fullmatch(r'SB2_m(\d+)n(\d+)_m(\d+)n(\d+)', name.replace('_model', ''))
+    return tuple(int(g) for g in match.groups()) if match else None
+
+
 def ode_system_humidity(t: float, y: np.ndarray, T_func: Callable, RH_func: Callable, params: Dict) -> np.ndarray:
     """
     ODE system for single-step with humidity dependence (ASAP/Waterman model).
@@ -582,6 +677,7 @@ ODE_SYSTEMS: Dict[str, Tuple[OdeSystemCallable, List[str], int]] = {
     "A+B->C": (ode_system_A_plus_B_C, ['Ea', 'A', 'initial_ratio_r'], 1), # Only Ea, A fitted (r fixed)
     "parallel_competing": (ode_system_parallel_competing, ['Ea1', 'A1', 'Ea2', 'A2'], 2), # Two competing pathways
     "humidity": (ode_system_humidity, ['Ea', 'A', 'B'], 1),  # Humidity-dependent kinetics
+    "SB2": (ode_system_sb2, ['Ea1', 'A1', 'Ea2', 'A2'], 1),  # Two parallel SB steps, one conversion
 }
 
 # --- Explicit declaration of which base parameters are Arrhenius pre-exponential
@@ -595,6 +691,7 @@ ODE_SYSTEMS_LOG_PARAMS: Dict[str, frozenset] = {
     "A+B->C": frozenset({'A'}),
     "parallel_competing": frozenset({'A1', 'A2'}),
     "humidity": frozenset({'A'}),  # A is log-scale, B is linear
+    "SB2": frozenset({'A1', 'A2'}),
 }
 
 def get_log_param_names(model_name: str) -> frozenset:
@@ -700,10 +797,35 @@ def list_available_models() -> Dict[str, List[str]]:
 def get_model_info(model_name: str, f_alpha_model: Optional[str] = None, f_alpha_params: Optional[Dict] = None,
                    f1_model: Optional[str] = None, f1_params: Optional[Dict] = None,
                    f2_model: Optional[str] = None, f2_params: Optional[Dict] = None,
-                   bimol_params: Optional[Dict] = None) -> Tuple[OdeSystemCallable, List[str], int, Dict]:
+                   bimol_params: Optional[Dict] = None,
+                   sb2_params: Optional[Dict] = None) -> Tuple[OdeSystemCallable, List[str], int, Dict]:
     """ Gets the ODE system, BASE parameter names (A scale), state dimension, and template. """
+    if model_name == "SB2":
+        ode_func, base_params, state_dim = ODE_SYSTEMS[model_name]
+        fixed = dict(sb2_params or {})
+        fitted_shape = [p for p in ('m1', 'n1', 'm2', 'n2') if p not in fixed]
+        return ode_func, base_params + fitted_shape, state_dim, fixed
     if model_name == "single_step":
-        if not f_alpha_model or f_alpha_model not in F_ALPHA_MODELS: raise ValueError(f"Valid f_alpha_model required")
+        if not f_alpha_model or f_alpha_model not in F_ALPHA_MODELS:
+            # Check if it's a grid SB model: SB_m{m}_n{n}
+            import re
+            sb_match = re.match(r'SB_m(\d+)_n(\d+)', f_alpha_model)
+            if sb_match:
+                # Grid SB model with fixed m,n
+                m_val = int(sb_match.group(1))
+                n_val = int(sb_match.group(2))
+                ode_func, base_params, state_dim = ODE_SYSTEMS[model_name]
+                f_alpha_func = f_sb_mn  # Use the SB function
+                # Fixed m, n values in params
+                full_params_dict_template = {
+                    'f_alpha_func': f_alpha_func,
+                    'f_alpha_params': {'m': float(m_val), 'n': float(n_val)}
+                }
+                # Return only base params (Ea, A) to be fitted
+                return ode_func, base_params, state_dim, full_params_dict_template
+            else:
+                raise ValueError(f"Valid f_alpha_model required, got: {f_alpha_model}")
+
         ode_func, base_params, state_dim = ODE_SYSTEMS[model_name]
         f_alpha_func = F_ALPHA_MODELS[f_alpha_model]
         # Use provided f_alpha_params if given, otherwise use defaults

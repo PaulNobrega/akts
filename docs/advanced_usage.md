@@ -65,6 +65,12 @@ prediction = predict_conversion(
 print(f"Final conversion: {prediction.conversion[-1]:.1%}")
 ```
 
+`predict_conversion()` returns an equal-tailed two-sided 95% bootstrap band
+(2.5th-97.5th percentiles) by default. Pass `ci_type='one-sided'` for the
+(MLE curve, 95th percentile) band used for ICH Q1E. If you pass your own
+`parameter_bounds`, keep Ea inside `akts.utils.EA_BOUNDS` (5-1000 kJ/mol), the
+range used by default for every Ea parameter.
+
 ## ODE Models (A→B→C and A+B→C)
 
 ### A→B→C (Consecutive Reactions)
@@ -135,6 +141,29 @@ fit_result = fit_kinetic_model(
 
 In the automated workflow, set the fixed ratio with the top-level `initial_ratio_r` parameter (default `1.0`). See [Automated Analysis](automated_analysis.md).
 
+### SB2 (Two-Step Sestak-Berggren)
+
+```python
+fit_result = fit_kinetic_model(
+    datasets=datasets,
+    model_name='SB2',
+    model_definition_args={'sb2_params': {}},  # fit m1, n1, m2, n2
+    initial_guesses={'Ea1': 160e3, 'A1': 1e20, 'Ea2': 60e3, 'A2': 1e6,
+                     'm1': 0.5, 'n1': 1.0, 'm2': 0.0, 'n2': 1.0},
+    parameter_bounds={'A1': (1e-10, 1e200), 'A2': (1e-10, 1e200),
+                      'm1': (0, 3), 'n1': (0, 8), 'm2': (0, 3), 'n2': (0, 8)}
+)
+
+# Grid variant: fixed integer exponents, only Ea1, A1, Ea2, A2 fitted
+grid_args = {'sb2_params': {'m1': 0.0, 'n1': 3.0, 'm2': 0.0, 'n2': 8.0}}
+```
+
+SB2 is fitted with `scipy.optimize.least_squares` (TRF) on the ODE residuals.
+A single direct call starts from your guess only. `auto_model_isothermal_data()`
+also tries data-driven Arrhenius starts (both step orderings) and keeps the fit
+with the lowest AIC, so prefer it with `models_to_try=['SB2']` or
+`models.kinetic.SB2_grid`. See [Kinetic Models](kinetic_models.md#two-step-sestak-berggren-sb2).
+
 ## Batch Processing
 
 ```python
@@ -200,6 +229,12 @@ ranked_models = discover_kinetic_models(
 for model in ranked_models:
     print(f"{model['rank']}. {model['model_name']}: R²={model['stats']['r_squared']:.4f}")
 ```
+
+`discover_kinetic_models()` ranks the fits with `rank_models()`: models below
+`min_r_squared` (default 0.70) or physically implausible are filtered out, and
+the rest are sorted by Akaike weight. Pass `apply_filters=False` to rank every
+successful fit. The former `score_weights` / `ranking_method` arguments no longer
+exist.
 
 ## JSON API Integration
 
@@ -288,7 +323,7 @@ instead of being integrated:
 
 This is automatic and needs no configuration. It is the reason a typical
 isothermal stability fit takes a fraction of a second. Models without a closed
-form (Fn, SB, SB_mn, SB_mnp, Bna, D1, A->B->C, A+B->C), and any non-isothermal
+form (Fn, SB, SB_mn, SB_mnp, Bna, D1, A->B->C, A+B->C, SB2 and the SB2 grid), and any non-isothermal
 data, use the ODE path below.
 
 ### Available solvers

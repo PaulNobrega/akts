@@ -179,7 +179,7 @@ class TestPlotFitOverlay:
 
         ax = fig.axes[0]
         assert len(ax.lines) == len(datasets)
-        assert len(ax.collections) == 2 * len(datasets)  # data markers + CI bands
+        assert len(ax.collections) == 3 * len(datasets)  # data markers + CI bands + PI bands
         legend_labels = [text.get_text() for text in ax.get_legend().get_texts()]
         assert sum('95% CI at' in label for label in legend_labels) == len(datasets)
 

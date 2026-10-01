@@ -11,51 +11,72 @@ from .utils import calculate_akaike_weights, calculate_adjusted_r_squared
 
 def rank_models(
     fit_results: List[FitResult],
-    score_weights: Optional[Dict[str, float]] = None,
-    ranking_method: str = 'combined'
+    min_r_squared: float = 0.70,
+    apply_filters: bool = True
 ) -> List[Dict]:
     """
-    Ranks a list of FitResult objects based on various ranking methods.
+    Ranks fitted models using filter-then-rank with Akaike weights.
+
+    Stage 1 (Filtering): Apply hard requirements for R² and physical plausibility
+    Stage 2 (Ranking): Rank survivors by Akaike weights
 
     Parameters
     ----------
     fit_results : List[FitResult]
         List of fit results to rank
-    score_weights : Dict[str, float], optional
-        Custom weights for combined scoring (only used when ranking_method='combined')
-        Default: {'bic': 0.4, 'r_squared': 0.4, 'rss': 0.1, 'n_params': 0.1}
-    ranking_method : str, default='combined'
-        Ranking approach:
-        - 'combined': Weighted combination of BIC, R², RSS, n_params (default)
-        - 'bic': Rank by BIC alone (lower is better)
-        - 'aic': Rank by AICc alone (lower is better)
-        - 'akaike_weight': Rank by Akaike weight (higher is better)
-        - 'r_squared': Rank by R² alone (higher is better)
+    min_r_squared : float, default=0.70
+        Minimum R² threshold for model selection. Models below this are filtered out
+        unless no models meet the requirement.
+    apply_filters : bool, default=True
+        Apply R² and plausibility filters before ranking
 
     Returns
     -------
     List[Dict]
-        Ranked models with stats, scores, and Akaike weights
+        Ranked models with stats, Akaike weights, and filter warnings.
+        Each dict contains:
+        - 'model_name': Model identifier
+        - 'rank': Ranking position (1 = best)
+        - 'stats': Dictionary with AIC, BIC, R², Akaike weight, plausibility
+        - 'parameters': Fitted parameter values
+        - 'filter_warning': Present on rank 1 if plausibility issues exist
 
     Notes
     -----
-    - BIC/AIC ranking methods provide direct interpretation: ΔBIC > 10 is "very strong"
-      evidence against the higher-BIC model
-    - Akaike weights give the probability each model is the best in the candidate set
-    - Combined scoring (default) balances multiple criteria but is less interpretable
-    - Simplicity penalty (for fitted shape parameters) is applied to all methods
+    Ranking Method:
+    - Uses ONLY Akaike weights (probability each model is best)
+    - Balances fit quality and model complexity automatically
+    - Simpler models preferred when fit quality is similar
+
+    Filter Logic:
+    1. If any model has R² ≥ min_r_squared AND is_physically_plausible:
+       Keep only models with R² ≥ min_r_squared AND is_physically_plausible
+    2. Otherwise:
+       Keep models with R² ≥ min_r_squared (any plausibility)
+       Add warning that top model has questionable plausibility
+
+    Akaike Weight Interpretation:
+    - Weight = 100% for one model → vastly superior (Δ_AIC > ~20)
+    - This is CORRECT behavior, not a bug
+    - Even distribution (e.g., 40%, 35%, 25%) → model uncertainty
+    - Sum of all weights = 100%
+
+    Physical Plausibility Criteria:
+    - Pre-exponential factor: A < 10²⁰ s⁻¹ (transition state theory limit)
+    - Activation energy: 5 < Ea < 1000 kJ/mol
+    - Shape parameters: m, n ≥ 0 (non-negative)
+
+    Examples
+    --------
+    >>> from akts import rank_models
+    >>> ranked = rank_models(fit_results, min_r_squared=0.70)
+    >>> top_model = ranked[0]
+    >>> print(f"Best model: {top_model['model_name']}")
+    >>> print(f"Akaike weight: {top_model['stats']['akaike_weight']:.1%}")
+    >>> print(f"Plausible: {top_model['stats']['is_physically_plausible']}")
     """
     if not fit_results:
         return []
-
-    # Validate ranking method
-    valid_methods = ['combined', 'bic', 'aic', 'akaike_weight', 'r_squared']
-    if ranking_method not in valid_methods:
-        raise ValueError(f"ranking_method must be one of {valid_methods}, got '{ranking_method}'")
-
-    # --- Define Default Weights (only used for 'combined') ---
-    default_weights = {'bic': 0.4, 'r_squared': 0.4, 'rss': 0.1, 'n_params': 0.1}
-    weights = score_weights if score_weights and np.isclose(sum(score_weights.values()), 1.0) else default_weights
 
     # --- Prepare data for ranking ---
     valid_fits_data = []
@@ -109,92 +130,72 @@ def rank_models(
         print("No models with valid stats found for ranking.")
         return []
 
-    # --- Calculate Score for each model based on ranking method ---
-    if ranking_method == 'combined':
-        # Original combined scoring with normalization
-        ranges = {key: (np.min(stat_values[key]), np.ptp(stat_values[key])) for key in ['rss', 'aic', 'bic', 'n_params']}
-        finite_r2 = [r for r in stat_values['r_squared'] if np.isfinite(r)]
-        ranges['r_squared'] = (np.min(finite_r2), np.max(finite_r2), np.ptp(finite_r2)) if finite_r2 else (0, 0, 0)
+    # --- Stage 1: Apply Filters (if enabled) ---
+    filter_warning = None
+    if apply_filters:
+        # Check if any model meets both criteria
+        good_models = [
+            item for item in valid_fits_data
+            if item['stats']['r_squared'] >= min_r_squared
+            and item['stats']['is_physically_plausible'] is not False
+        ]
 
-        for item in valid_fits_data:
-            stats = item['stats']
-            score = 0.0
-            for key, weight in weights.items():
-                if key == 'r_squared':
-                    min_r2_norm, max_r2_norm, range_r2_norm = ranges['r_squared']
-                    val = stats.get('r_squared', -np.inf)
-                    if not np.isfinite(val):
-                        norm_val = 1.0  # Penalize invalid R2 maximally
-                    elif range_r2_norm > 1e-9:
-                        norm_val = (max_r2_norm - val) / range_r2_norm  # Higher R2 -> lower score component
-                    else:
-                        norm_val = 0.0
-                    score += weight * norm_val
-                elif key in ['rss', 'aic', 'bic', 'n_params']:
-                    min_val, range_width = ranges[key]
-                    val = stats.get(key, np.inf)
-                    if not np.isfinite(val):
-                        norm_val = 1.0
-                    elif range_width > 1e-9:
-                        norm_val = (val - min_val) / range_width
-                    else:
-                        norm_val = 0.0
-                    score += weight * norm_val
-            item['score'] = score
+        if good_models:
+            # Keep only models meeting both criteria
+            valid_fits_data = good_models
+            warnings.warn(
+                f"Applied filters: R² ≥ {min_r_squared:.2f} AND physically plausible. "
+                f"Kept {len(valid_fits_data)} models out of {len(stat_values['aic'])} total."
+            )
+        else:
+            # No models meet both criteria - try relaxing plausibility
+            acceptable_models = [
+                item for item in valid_fits_data
+                if item['stats']['r_squared'] >= min_r_squared
+            ]
 
-    elif ranking_method == 'bic':
-        # Rank by BIC alone (lower is better)
-        for item in valid_fits_data:
-            item['score'] = item['stats']['bic']
+            if acceptable_models:
+                # Keep models with good R² even if implausible
+                valid_fits_data = acceptable_models
+                filter_warning = {
+                    'type': 'no_plausible_models',
+                    'message': (
+                        f"⚠ WARNING: No physically plausible models achieved R² ≥ {min_r_squared:.2f}. "
+                        f"Selected model has questionable energetic plausibility. "
+                        f"Physical plausibility criteria: A < 1e20 s⁻¹, 5 < Ea < 1000 kJ/mol. "
+                        f"Use predictions with caution."
+                    ),
+                    'min_r_squared': min_r_squared,
+                    'n_models_before': len(stat_values['aic']),
+                    'n_models_after': len(valid_fits_data)
+                }
+                warnings.warn(filter_warning['message'])
+            else:
+                # No models meet even R² requirement - keep all and warn
+                filter_warning = {
+                    'type': 'no_good_models',
+                    'message': (
+                        f"⚠ CRITICAL: No models achieved R² ≥ {min_r_squared:.2f}. "
+                        f"All {len(valid_fits_data)} models retained, but fit quality is poor. "
+                        f"Consider collecting more data or adjusting min_r_squared."
+                    ),
+                    'min_r_squared': min_r_squared,
+                    'n_models': len(valid_fits_data)
+                }
+                warnings.warn(filter_warning['message'])
 
-    elif ranking_method == 'aic':
-        # Rank by AICc alone (lower is better)
-        for item in valid_fits_data:
-            item['score'] = item['stats']['aic']
+    # --- Stage 2: Rank by Akaike Weights ---
+    # Akaike weight = probability each model is best in candidate set
+    # Higher weight is better, so negate for ascending sort
+    # NOTE: Akaike weights already include complexity penalty via AIC (AIC = -2*ln(L) + 2*k)
+    # No additional simplicity penalty needed - that would double-penalize complexity!
+    temp_akaike_weights = calculate_akaike_weights([item['stats']['aic'] for item in valid_fits_data])
+    for item, w in zip(valid_fits_data, temp_akaike_weights):
+        item['score'] = -w  # Negate so higher weight = lower score = better rank
+        item['simplicity_penalty'] = 0.0  # No additional penalty with Akaike-only
 
-    elif ranking_method == 'akaike_weight':
-        # Rank by Akaike weight (higher is better, so negate for ascending sort)
-        # Compute Akaike weights first
-        temp_akaike_weights = calculate_akaike_weights([item['stats']['aic'] for item in valid_fits_data])
-        for item, w in zip(valid_fits_data, temp_akaike_weights):
-            item['score'] = -w  # Negate so higher weight = lower score = better rank
-
-    elif ranking_method == 'r_squared':
-        # Rank by R² alone (higher is better, so negate for ascending sort)
-        for item in valid_fits_data:
-            r2 = item['stats']['r_squared']
-            item['score'] = -r2 if np.isfinite(r2) else np.inf  # Negate for ascending sort
-
-    # --- Apply Simplicity Penalty for Fitted Shape Parameters ---
-    # Prefer lower values of fitted parameters (n, m, p) when fit quality is similar
-    # Penalty is small (~0.01 per unit) so it only affects ranking when scores are close
-    for item in valid_fits_data:
-        params = item['parameters']
-        simplicity_penalty = 0.0
-
-        # Fn model: prefer lower n (e.g., n=1 over n=3)
-        if 'n' in params and item['model_name'] == 'single_step':
-            # Check if this is a fitted n (not fixed F1/F2/F3)
-            # Penalty scales with distance from n=1 (most common reaction order)
-            n_val = params['n']
-            if n_val > 1.0:
-                simplicity_penalty += 0.01 * (n_val - 1.0)  # Penalize n > 1
-
-        # SB/SB_mnp models: prefer lower m,n values
-        if 'm' in params and 'n' in params:
-            m_val = params['m']
-            n_val = params['n']
-            # Penalty scales with distance from standard SB_mn values (m=0.5, n=1.0)
-            simplicity_penalty += 0.01 * abs(m_val - 0.5)
-            simplicity_penalty += 0.01 * abs(n_val - 1.0)
-
-            # Additional penalty for p in SB_mnp (prefer p=0, i.e., reduces to SB)
-            if 'p' in params:
-                p_val = params['p']
-                simplicity_penalty += 0.01 * abs(p_val)
-
-        item['score'] += simplicity_penalty
-        item['simplicity_penalty'] = simplicity_penalty  # Store for transparency
+    # Note: Physical plausibility is handled as a FILTER, not a penalty
+    # Models with implausible parameters are removed before ranking (unless no plausible options exist)
 
     # --- Sort by Score (ascending) ---
     valid_fits_data.sort(key=lambda x: x['score'])
@@ -207,5 +208,9 @@ def rank_models(
     akaike_weights = calculate_akaike_weights([item['stats']['aic'] for item in valid_fits_data])
     for item, w in zip(valid_fits_data, akaike_weights):
         item['stats']['akaike_weight'] = w
+
+    # Add filter warning to first result if present
+    if filter_warning is not None and valid_fits_data:
+        valid_fits_data[0]['filter_warning'] = filter_warning
 
     return valid_fits_data

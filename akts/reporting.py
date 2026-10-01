@@ -15,7 +15,7 @@ from .datatypes import KineticDataset, FitResult, BootstrapResult, PredictionRes
 from .json_utils import convert_numpy_to_python
 from .regulatory_plots import create_regulatory_shelf_life_plot, create_regulatory_comparison_plot
 from .utils import seconds_per_time_unit as _seconds_per_time_unit, SECONDS_PER_MONTH
-from .models import model_display_name
+from .models import model_display_name, parse_sb2_model
 
 
 def _embed_base64_image(fig) -> str:
@@ -125,15 +125,39 @@ def _create_comparison_table_html(ranked_models: List[Dict]) -> str:
     return html
 
 
-def _fit_ci_for_dataset(fit_result: FitResult, i: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """Bootstrap (lower, upper) conversion band for dataset i, if one was computed."""
-    bands = getattr(fit_result, 'conversion_simulated_ci', None)
+def _fit_ci_for_dataset(fit_result: FitResult, i: int,
+                        attr: str = 'conversion_simulated_ci') -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """(lower, upper) band for dataset i: bootstrap CI by default, or attr='conversion_simulated_pi'."""
+    bands = getattr(fit_result, attr, None)
     if not bands or i >= len(bands) or bands[i] is None:
         return None
     lower, upper = bands[i]
     if lower is None or upper is None:
         return None
     return np.asarray(lower, dtype=float), np.asarray(upper, dtype=float)
+
+
+TYPICAL_EA_RANGES = (
+    ('Thermal denaturation &amp; unfolding (upper limit)', '400 – 800',
+     'Cooperatively breaking a large network of weak non-covalent interactions (hydrogen bonds, '
+     'hydrophobic effects) at once requires an exceptionally high barrier.'),
+    ('Enzymatic / proteolytic cleavage', '20 – 100',
+     'Proteases (e.g. proteasome, lysosomal enzymes) catalyze peptide-bond hydrolysis, lowering Ea '
+     'to biological ranges.'),
+    ('Spontaneous / pyrolytic hydrolysis', '90 – 140',
+     'Uncatalyzed chemical or thermal degradation of amino acids or stable protein backbones.'),
+)
+
+
+def _typical_ea_note_html() -> str:
+    rows = ''.join(f'<tr><td>{m}</td><td>{r}</td><td>{d}</td></tr>' for m, r, d in TYPICAL_EA_RANGES)
+    return (
+        '<p style="font-size: 0.9em; color: #666; margin-top: 10px;"><strong>Note: typical activation '
+        'energy ranges.</strong> Use these to judge whether a fitted Ea is physically reasonable for the '
+        'expected degradation mechanism. Fits are bounded to 5 – 1000 kJ/mol.</p>'
+        '<table class="param-table"><thead><tr><th>Mechanism</th><th>Typical Ea (kJ/mol)</th>'
+        f'<th>Description</th></tr></thead><tbody>{rows}</tbody></table>'
+    )
 
 
 def _rgba(color: str, alpha: float) -> str:
@@ -146,84 +170,49 @@ def _create_fit_plot_matplotlib(
     fit_result: FitResult,
     title: str = "Model Fit"
 ) -> str:
-    """
-    Create static fit plot using matplotlib, return as base64.
-
-    Parameters
-    ----------
-    datasets : List[KineticDataset]
-        Experimental datasets
-    fit_result : FitResult
-        Fitted model result
-    title : str
-        Plot title
-
-    Returns
-    -------
-    str
-        Base64-encoded PNG image string
-    """
+    """Static fit plot: one column per temperature (own y-scale) with 95% CI and PI; residuals below."""
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         warnings.warn("matplotlib not available. Skipping static plots.")
         return ""
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), height_ratios=[3, 1])
-
-    # Keep the static palette and dataset selection in step with Plotly.
+    n_cols = max(len(datasets), 1)
+    fig, axes = plt.subplots(2, n_cols, figsize=(4.2 * n_cols, 6.5), height_ratios=[3, 1], squeeze=False)
     viridis_colors = ['#440154', '#3b528b', '#21918c', '#5ec962', '#fde725']
     colors = [viridis_colors[int(i * (len(viridis_colors) - 1) / max(len(datasets) - 1, 1))]
               for i in range(len(datasets))]
+    simulated = getattr(fit_result, 'conversion_simulated', None)
 
     for i, dataset in enumerate(datasets):
-        temp_K = dataset.temperature.mean()
-        temp_C = temp_K - 273.15
-
-        # Experimental data
-        ax1.scatter(dataset.time, dataset.conversion,
-                   label=f'Data @ {temp_C:.0f}°C',
-                   color=colors[i], alpha=0.7, s=40)
-
-        # Fitted curve (if available)
-        if hasattr(fit_result, 'conversion_simulated') and fit_result.conversion_simulated is not None:
-            if isinstance(fit_result.conversion_simulated, list):
-                if i < len(fit_result.conversion_simulated):
-                    band = _fit_ci_for_dataset(fit_result, i)
-                    if band is not None:
-                        ax1.fill_between(dataset.time, band[0], band[1], color=colors[i], alpha=0.2,
-                                         linewidth=0, label=f'95% CI @ {temp_C:.0f}°C')
-                    ax1.plot(dataset.time, fit_result.conversion_simulated[i],
-                            label=f'Fit @ {temp_C:.0f}°C',
-                            color=colors[i], linewidth=2)
-
-                    # Residuals
-                    residuals = dataset.conversion - fit_result.conversion_simulated[i]
-                    ax2.scatter(dataset.time, residuals, color=colors[i], alpha=0.7, s=20)
-            else:
-                # Single dataset case
-                ax1.plot(dataset.time, fit_result.conversion_simulated,
-                        label='Fit', color=colors[i], linewidth=2)
-                residuals = dataset.conversion - fit_result.conversion_simulated
-                ax2.scatter(dataset.time, residuals, color=colors[i], alpha=0.7, s=20)
-
-    ax1.set_xlabel('Time', fontsize=12)
-    ax1.set_ylabel('Conversion', fontsize=12)
-    ax1.set_title(title, fontsize=14, fontweight='bold')
-    ax1.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize=10)
-    ax1.grid(True, alpha=0.3)
-    ax1.set_ylim(-0.05, 1.05)
-
-    # Residuals plot
-    ax2.axhline(y=0, color='k', linestyle='--', linewidth=1)
-    ax2.set_xlabel('Time', fontsize=12)
-    ax2.set_ylabel('Residuals', fontsize=12)
-    ax2.grid(True, alpha=0.3)
-
-    plt.tight_layout(rect=(0, 0, 0.78, 1))
+        ax1, ax2 = axes[0][i], axes[1][i]
+        temp_C = dataset.temperature.mean() - 273.15
+        if isinstance(simulated, list) and i < len(simulated):
+            pband = _fit_ci_for_dataset(fit_result, i, 'conversion_simulated_pi')
+            if pband is not None:
+                ax1.fill_between(dataset.time / 86400.0, pband[0], pband[1], color=colors[i], alpha=0.12,
+                                 linewidth=0, label='95% PI')
+            band = _fit_ci_for_dataset(fit_result, i)
+            if band is not None:
+                ax1.fill_between(dataset.time / 86400.0, band[0], band[1], color=colors[i], alpha=0.35,
+                                 linewidth=0, label='95% CI')
+            ax1.plot(dataset.time / 86400.0, simulated[i], color=colors[i], linewidth=2, label='Fit')
+            ax2.scatter(dataset.time / 86400.0, dataset.conversion - np.asarray(simulated[i]),
+                        color=colors[i], alpha=0.7, s=20)
+        ax1.scatter(dataset.time / 86400.0, dataset.conversion, color=colors[i], alpha=0.8, s=40,
+                    edgecolors='black', linewidths=0.5, label='Data', zorder=5)
+        ax1.set_title(f'{temp_C:.0f}°C', fontsize=12)
+        ax1.grid(True, alpha=0.3)
+        ax1.legend(loc='upper left', fontsize=8)
+        ax2.axhline(y=0, color='k', linestyle='--', linewidth=1)
+        ax2.set_xlabel('Time (days)', fontsize=11)
+        ax2.grid(True, alpha=0.3)
+    axes[0][0].set_ylabel('Conversion', fontsize=12)
+    axes[1][0].set_ylabel('Residuals', fontsize=12)
+    fig.suptitle(title, fontsize=14, fontweight='bold')
+    fig.tight_layout()
     image_str = _embed_base64_image(fig)
     plt.close(fig)
-
     return f'<img src="{image_str}" alt="{title}" style="max-width: 100%;" />'
 
 
@@ -233,21 +222,9 @@ def _create_fit_plot_interactive(
     title: str = "Model Fit"
 ) -> str:
     """
-    Create interactive fit plot using Plotly, return as HTML div.
-
-    Parameters
-    ----------
-    datasets : List[KineticDataset]
-        Experimental datasets
-    fit_result : FitResult
-        Fitted model result
-    title : str
-        Plot title
-
-    Returns
-    -------
-    str
-        HTML div with Plotly plot
+    Interactive fit plot: one column per temperature (own y-scale, so low-conversion
+    series and their narrow bands stay visible), fit + 95% CI + 95% PI on top,
+    residuals below.
     """
     try:
         import plotly.graph_objects as go
@@ -256,114 +233,64 @@ def _create_fit_plot_interactive(
         warnings.warn("plotly not available. Falling back to static plots.")
         return _create_fit_plot_matplotlib(datasets, fit_result, title)
 
+    n_cols = max(len(datasets), 1)
     fig = make_subplots(
-        rows=2, cols=1,
+        rows=2, cols=n_cols,
         row_heights=[0.7, 0.3],
-        subplot_titles=(title, "Residuals"),
-        vertical_spacing=0.12
+        subplot_titles=[f'{ds.temperature.mean() - 273.15:.0f}°C' for ds in datasets] + [''] * n_cols,
+        vertical_spacing=0.12, horizontal_spacing=0.06,
     )
 
-    # Generate colors without matplotlib dependency
-    # Simple viridis-like color scheme
     viridis_colors = ['rgb(68, 1, 84)', 'rgb(59, 82, 139)', 'rgb(33, 145, 140)',
                       'rgb(94, 201, 98)', 'rgb(253, 231, 37)']
-    n_datasets = len(datasets)
-    colors = [viridis_colors[int(i * (len(viridis_colors)-1) / max(n_datasets-1, 1))]
-              for i in range(n_datasets)]
+    colors = [viridis_colors[int(i * (len(viridis_colors)-1) / max(len(datasets)-1, 1))]
+              for i in range(len(datasets))]
+    simulated = getattr(fit_result, 'conversion_simulated', None)
 
     for i, dataset in enumerate(datasets):
-        temp_K = dataset.temperature.mean()
-        temp_C = temp_K - 273.15
+        col = i + 1
+        temp_C = dataset.temperature.mean() - 273.15
+        t_list = (dataset.time / 86400.0).tolist()
 
-        # Experimental data
-        fig.add_trace(
-            go.Scatter(
-                x=dataset.time.tolist(),
-                y=dataset.conversion.tolist(),
-                mode='markers',
-                name=f'Data @ {temp_C:.0f}°C',
-                marker=dict(color=colors[i], size=8, opacity=0.7),
-                hovertemplate='Time: %{x}<br>Conversion: %{y:.4f}<extra></extra>'
-            ),
-            row=1, col=1
-        )
+        if isinstance(simulated, list) and i < len(simulated):
+            for attr, label, opacity in (('conversion_simulated_pi', 'PI', 0.12),
+                                         ('conversion_simulated_ci', 'CI', 0.35)):
+                band = _fit_ci_for_dataset(fit_result, i, attr)
+                if band is None:
+                    continue
+                fig.add_trace(go.Scatter(
+                    x=t_list + t_list[::-1], y=band[1].tolist() + band[0].tolist()[::-1],
+                    fill='toself', fillcolor=_rgba(colors[i], opacity),
+                    line=dict(color='rgba(255,255,255,0)'),
+                    name=f'95% {label} @ {temp_C:.0f}°C', hoverinfo='skip',
+                ), row=1, col=col)
+            fig.add_trace(go.Scatter(
+                x=t_list, y=np.asarray(simulated[i]).tolist(), mode='lines',
+                name=f'Fit @ {temp_C:.0f}°C', line=dict(color=colors[i], width=2),
+                hovertemplate='Time: %{x:.1f} d<br>Conversion: %{y:.4f}<extra></extra>',
+            ), row=1, col=col)
+            residuals = dataset.conversion - np.asarray(simulated[i])
+            fig.add_trace(go.Scatter(
+                x=t_list, y=residuals.tolist(), mode='markers',
+                name=f'Residuals @ {temp_C:.0f}°C', marker=dict(color=colors[i], size=6, opacity=0.7),
+                showlegend=False, hovertemplate='Time: %{x:.1f} d<br>Residual: %{y:.4f}<extra></extra>',
+            ), row=2, col=col)
+            fig.add_hline(y=0, line=dict(color='black', dash='dash', width=1), row=2, col=col)
 
-        # Fitted curve
-        if hasattr(fit_result, 'conversion_simulated') and fit_result.conversion_simulated is not None:
-            if isinstance(fit_result.conversion_simulated, list):
-                if i < len(fit_result.conversion_simulated):
-                    band = _fit_ci_for_dataset(fit_result, i)
-                    if band is not None:
-                        t_list = dataset.time.tolist()
-                        fig.add_trace(
-                            go.Scatter(
-                                x=t_list + t_list[::-1],
-                                y=band[1].tolist() + band[0].tolist()[::-1],
-                                fill='toself',
-                                fillcolor=_rgba(colors[i], 0.2),
-                                line=dict(color='rgba(255,255,255,0)'),
-                                name=f'95% CI @ {temp_C:.0f}°C',
-                                hoverinfo='skip',
-                            ),
-                            row=1, col=1
-                        )
-                    fig.add_trace(
-                        go.Scatter(
-                            x=dataset.time.tolist(),
-                            y=fit_result.conversion_simulated[i].tolist(),
-                            mode='lines',
-                            name=f'Fit @ {temp_C:.0f}°C',
-                            line=dict(color=colors[i], width=2),
-                            hovertemplate='Time: %{x}<br>Conversion: %{y:.4f}<extra></extra>'
-                        ),
-                        row=1, col=1
-                    )
+        fig.add_trace(go.Scatter(
+            x=t_list, y=dataset.conversion.tolist(), mode='markers',
+            name=f'Data @ {temp_C:.0f}°C',
+            marker=dict(color=colors[i], size=8, opacity=0.8, line=dict(color='black', width=0.5)),
+            hovertemplate='Time: %{x:.1f} d<br>Conversion: %{y:.4f}<extra></extra>',
+        ), row=1, col=col)
+        fig.update_xaxes(title_text="Time (days)", row=2, col=col)
 
-                    # Residuals
-                    residuals = dataset.conversion - fit_result.conversion_simulated[i]
-                    fig.add_trace(
-                        go.Scatter(
-                            x=dataset.time.tolist(),
-                            y=residuals.tolist(),
-                            mode='markers',
-                            name=f'Residuals @ {temp_C:.0f}°C',
-                            marker=dict(color=colors[i], size=6, opacity=0.7),
-                            showlegend=False,
-                            hovertemplate='Time: %{x}<br>Residual: %{y:.4f}<extra></extra>'
-                        ),
-                        row=2, col=1
-                    )
-
-    # Add zero line to residuals spanning full x-axis
-    if datasets:
-        # Get full time range across ALL datasets
-        all_times = np.concatenate([ds.time for ds in datasets])
-        t_min, t_max = all_times.min(), all_times.max()
-        fig.add_trace(
-            go.Scatter(
-                x=[t_min, t_max],
-                y=[0, 0],
-                mode='lines',
-                line=dict(color='black', dash='dash', width=1),
-                showlegend=False,
-                hoverinfo='skip'
-            ),
-            row=2, col=1
-        )
-
-    fig.update_xaxes(title_text="Time", row=1, col=1)
-    fig.update_xaxes(title_text="Time", row=2, col=1)
-    fig.update_yaxes(title_text="Conversion", row=1, col=1, range=[-0.05, 1.05])
+    fig.update_yaxes(title_text="Conversion", row=1, col=1)
     fig.update_yaxes(title_text="Residuals", row=2, col=1)
-
     fig.update_layout(
-        height=700,
-        hovermode='closest',
-        template='plotly_white',
-        showlegend=True,
-        legend=dict(x=1.05, y=1, xanchor='left', yanchor='top')
+        title=dict(text=title), height=650, hovermode='closest', template='plotly_white',
+        showlegend=True, legend=dict(orientation='h', x=0, y=-0.12, xanchor='left', yanchor='top'),
     )
-
     return fig.to_html(include_plotlyjs='cdn', div_id=f'plot_{title.replace(" ", "_")}')
 
 
@@ -430,12 +357,18 @@ def _create_prediction_plot_interactive(
     ))
 
     # Add temperature to title if available
-    temp_K = predictions.get('temperature_K')
-    if temp_K is not None:
-        temp_C = temp_K - 273.15
-        title_with_temp = f"{title} (at {temp_C:.1f}°C / {temp_K:.1f} K)"
+    temp = predictions.get('temperature')
+    temp_units = predictions.get('temperature_units', 'K')
+    if temp is not None:
+        title_with_temp = f"{title} (at {temp:.1f}°{temp_units})"
     else:
-        title_with_temp = title
+        # Fallback to temperature_K for backward compatibility
+        temp_K = predictions.get('temperature_K')
+        if temp_K is not None:
+            temp_C = temp_K - 273.15
+            title_with_temp = f"{title} (at {temp_C:.1f}°C / {temp_K:.1f} K)"
+        else:
+            title_with_temp = title
 
     fig.update_xaxes(title_text=f"Time ({time_unit})")
     fig.update_yaxes(title_text="Conversion", range=[-0.05, 1.05])
@@ -470,9 +403,15 @@ def _create_prediction_plot_matplotlib(
     if lower is not None and upper is not None:
         ax.fill_between(time, lower, upper, color='#0064c8', alpha=0.2, label='95% CI')
     ax.plot(time, conversion, color='#0064c8', linewidth=3, label='Predicted Conversion')
-    temp_K = predictions.get('temperature_K')
-    if temp_K is not None:
-        title = f"{title} (at {temp_K - 273.15:.1f}°C / {temp_K:.1f} K)"
+    temp = predictions.get('temperature')
+    temp_units = predictions.get('temperature_units', 'K')
+    if temp is not None:
+        title = f"{title} (at {temp:.1f}°{temp_units})"
+    else:
+        # Fallback to temperature_K for backward compatibility
+        temp_K = predictions.get('temperature_K')
+        if temp_K is not None:
+            title = f"{title} (at {temp_K - 273.15:.1f}°C / {temp_K:.1f} K)"
     ax.set(title=title, xlabel=f"Time ({time_unit})", ylabel="Conversion", ylim=(-0.05, 1.05))
     ax.grid(True, alpha=0.3)
     ax.legend(loc='best')
@@ -984,6 +923,12 @@ def _generate_html_template(
     <div class="section">
         <h2>Model Fit Visualization</h2>
         {fit_plots_html}
+        <p style="font-size: 0.9em; color: #666;">
+            <strong>Bands:</strong> the darker <strong>95% CI</strong> is the uncertainty of the fitted curve itself
+            (bootstrap parameter uncertainty). The lighter <strong>95% PI</strong> (prediction interval) adds the residual
+            scatter of individual measurements; about 95% of data points should fall inside it if the model is adequate.
+            These bands are for visualization; the regulatory shelf-life uses its own one-sided bound.
+        </p>
     </div>
 
     {f'<div class="section"><h2>Prediction/Extrapolation</h2>{prediction_plot_html}</div>' if prediction_plot_html else ''}
@@ -1055,10 +1000,14 @@ def _create_methods_section_html(selected_model: Dict, datasets: List[KineticDat
     }
 
     base_model_name = model_name.replace('_model', '')
+    is_sb2 = base_model_name == 'SB2' or parse_sb2_model(base_model_name) is not None or (
+        {'Ea1', 'Ea2', 'm1', 'n1'} <= set(params))
     if base_model_name == 'Friedman':
         model_equation = 'No reaction model assumed; activation energy is estimated as a function of conversion, Ea(α)'
     elif base_model_name == 'A->B->C':
         model_equation = 'Sequential reactions A → B → C with separate kinetics for each step'
+    elif is_sb2:
+        model_equation = 'dα/dt = k₁(T)·α^m₁·(1 - α)^n₁ + k₂(T)·α^m₂·(1 - α)^n₂ (two parallel Sestak-Berggren steps)'
     else:
         model_equation = model_equations.get(model_name, 'Model-specific reaction model')
 
@@ -1067,7 +1016,7 @@ def _create_methods_section_html(selected_model: Dict, datasets: List[KineticDat
     A = finite_number(params.get('A'))
 
     step_parameters = None
-    if base_model_name == 'A->B->C':
+    if base_model_name == 'A->B->C' or is_sb2:
         step_parameters = {
             'Ea1': finite_number(params.get('Ea1')),
             'A1': finite_number(params.get('A1')),
@@ -1075,7 +1024,25 @@ def _create_methods_section_html(selected_model: Dict, datasets: List[KineticDat
             'A2': finite_number(params.get('A2')),
         }
 
-    if step_parameters and all(value is not None for value in step_parameters.values()):
+    if is_sb2 and step_parameters and all(value is not None for value in step_parameters.values()):
+        shape = {k: finite_number(params.get(k)) for k in ('m1', 'n1', 'm2', 'n2')}
+        fixed = parse_sb2_model(base_model_name)
+        if fixed:
+            shape = dict(zip(('m1', 'n1', 'm2', 'n2'), (float(v) for v in fixed)))
+        def fmt(v):
+            return 'n/a' if v is None else f'{v:.3f}'
+        arrhenius_html = f'''
+        <h3>Arrhenius Temperature Dependence by Reaction Step</h3>
+        <p>Two parallel steps act on the same conversion; each has its own rate constant:</p>
+        <ul>
+            <li><strong>Step 1:</strong> k₁(T) = A₁ · exp(-Ea₁ / RT), Ea₁ = {step_parameters['Ea1']/1000:.1f} kJ/mol,
+                ln(A₁·s) = {np.log(step_parameters['A1']):.3f}, m₁ = {fmt(shape['m1'])}, n₁ = {fmt(shape['n1'])}</li>
+            <li><strong>Step 2:</strong> k₂(T) = A₂ · exp(-Ea₂ / RT), Ea₂ = {step_parameters['Ea2']/1000:.1f} kJ/mol,
+                ln(A₂·s) = {np.log(step_parameters['A2']):.3f}, m₂ = {fmt(shape['m2'])}, n₂ = {fmt(shape['n2'])}</li>
+        </ul>
+        <p>R is the gas constant (8.314 J/(mol·K)); T is absolute temperature (K).</p>
+        '''
+    elif step_parameters and all(value is not None for value in step_parameters.values()):
         arrhenius_html = f'''
         <h3>Arrhenius Temperature Dependence by Reaction Step</h3>
         <p>Each step has its own temperature-dependent rate constant:</p>
@@ -1114,6 +1081,8 @@ def _create_methods_section_html(selected_model: Dict, datasets: List[KineticDat
             estimates rather than one pre-exponential factor.
         </p>
         '''
+    if (step_parameters and all(v is not None for v in step_parameters.values())) or (Ea is not None and A is not None):
+        arrhenius_html += _typical_ea_note_html()
 
     if base_model_name == 'Friedman':
         kinetic_model_html = '''
@@ -1612,8 +1581,13 @@ def generate_isothermal_report(
                 A = format_number(params['A'], '.4e')
                 details_html += f'<tr><td><strong>A</strong> (Pre-exponential Factor)</td><td>{A}</td><td>s⁻¹</td></tr>'
 
+            step_labels = None
             if selected_model_name == 'A->B->C':
-                for step_name, description in (('1', 'A → B'), ('2', 'B → C')):
+                step_labels = (('1', 'A → B'), ('2', 'B → C'))
+            elif {'Ea1', 'Ea2'} <= set(params):
+                step_labels = (('1', 'Step 1'), ('2', 'Step 2'))
+            if step_labels:
+                for step_name, description in step_labels:
                     ea_name, a_name = f'Ea{step_name}', f'A{step_name}'
                     if ea_name in params:
                         ea_value = format_number(params[ea_name], '.2f')
@@ -1631,6 +1605,8 @@ def generate_isothermal_report(
                     details_html += f'<tr><td>{param}</td><td>{formatted_value}</td><td>—</td></tr>'
 
             details_html += '</tbody></table>'
+            if any(p.startswith('Ea') for p in params):
+                details_html += _typical_ea_note_html()
 
         # Add goodness of fit statistics
         details_html += "<h3>Goodness of Fit</h3>"

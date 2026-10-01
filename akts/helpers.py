@@ -20,9 +20,9 @@ from .bootstrap import run_bootstrap, _normalize_bootstrap_method
 from .prediction import predict_conversion, predict_conversion_model_free
 from .ranking import rank_models
 from .isoconversional import run_friedman, run_bootstrap_friedman
-from .models import get_log_param_names, MODEL_DISPLAY_NAMES, model_display_name
+from .models import get_log_param_names, MODEL_DISPLAY_NAMES, model_display_name, parse_sb2_model
 from .model_selector import models
-from .utils import construct_profile, R_GAS, calculate_aic, calculate_bic, TIME_UNITS_TO_SECONDS, SECONDS_PER_MONTH
+from .utils import construct_profile, R_GAS, EA_BOUNDS, calculate_aic, calculate_bic, TIME_UNITS_TO_SECONDS, SECONDS_PER_MONTH
 from .empirical import fit_empirical_global, predict_empirical
 from .json_utils import (
     parse_json_data,
@@ -33,6 +33,7 @@ from .json_utils import (
     convert_numpy_to_python
 )
 from .reporting import generate_isothermal_report
+from .shelf_life import calculate_shelf_life_ich_q1e, time_to_specification
 
 
 # Time unit conversions to seconds. Kept as an alias for backward compatibility
@@ -54,8 +55,13 @@ EMPIRICAL_MODELS = models.empirical.all
 LOADER_TIME_UNITS_TO_SECONDS = {'s': 1, 'min': 60, 'h': 3600, 'days': 86400, 'weeks': 604800}
 
 
+# The commercial two-step fit has ln A1 = 422 (A1 ~ 1e183); the single-step A cap would forbid it.
+SB2_A_BOUNDS = (1e-10, 1e200)
+
+
 def _harmonize_loaded_datasets(datasets: List[KineticDataset], readout_type: str,
-                               progress: Callable) -> None:
+                               progress: Callable, readout_initial: Optional[float] = None,
+                               readout_final: Optional[float] = None) -> None:
     """Put all file-loaded datasets on seconds and on one shared conversion scale (in place)."""
     for ds in datasets:
         unit = ds.metadata.get('time_units')
@@ -71,8 +77,11 @@ def _harmonize_loaded_datasets(datasets: List[KineticDataset], readout_type: str
         return
     # Per-file min-max scaling forces every temperature to end at conversion 1, which
     # hides the Arrhenius trend. Use one start/end for all files instead.
-    start = float(np.mean([r[0] for r in raw]))
-    end = float(max(r.max() for r in raw)) if readout_type == 'increasing' else float(min(r.min() for r in raw))
+    start = float(readout_initial) if readout_initial is not None else float(np.mean([r[0] for r in raw]))
+    if readout_final is not None:
+        end = float(readout_final)
+    else:
+        end = float(max(r.max() for r in raw)) if readout_type == 'increasing' else float(min(r.min() for r in raw))
     if abs(end - start) < 1e-12:
         return
     for ds, r in zip(datasets, raw):
@@ -116,11 +125,45 @@ def _temperature_to_kelvin(temp: float, unit: str) -> float:
         raise ValueError(f"Unknown temperature unit: {unit}. Supported: 'K', 'C', 'F'")
 
 
+def _prediction_bands(
+    datasets: List[KineticDataset],
+    fitted: List[np.ndarray],
+    ci_bands: List[Optional[Tuple[np.ndarray, np.ndarray]]],
+    n_parameters: int,
+    confidence_level: float,
+) -> Optional[List[Tuple[np.ndarray, np.ndarray]]]:
+    """Pointwise prediction bands: fit-curve uncertainty plus residual noise, per dataset.
+
+    Band half-width = t * sqrt(se_fit^2 + s_i^2). s_i^2 is dataset i's residual variance
+    (scatter differs strongly between temperatures), with the p fitted parameters' degrees
+    of freedom charged to datasets in proportion to their size; se_fit comes from the
+    bootstrap CI half-width (zero if no CI).
+    """
+    from scipy.stats import t as t_dist
+    residuals = [np.asarray(ds.conversion, float) - np.asarray(f, float) for ds, f in zip(datasets, fitted)]
+    residuals = [r[np.isfinite(r)] for r in residuals]
+    n_total = sum(r.size for r in residuals)
+    dof = n_total - int(n_parameters)
+    if dof < 1:
+        return None
+    t_crit = float(t_dist.ppf(0.5 + confidence_level / 2.0, dof))
+    z = float(t_dist.ppf(0.5 + confidence_level / 2.0, 1e9))
+    bands = []
+    for r, f, ci in zip(residuals, fitted, ci_bands):
+        f = np.asarray(f, float)
+        s2 = float(np.sum(r ** 2) / (r.size * dof / n_total)) if r.size else 0.0
+        se_fit = np.zeros_like(f) if ci is None else (np.asarray(ci[1], float) - np.asarray(ci[0], float)) / (2.0 * z)
+        half = t_crit * np.sqrt(se_fit ** 2 + s2)
+        bands.append((np.clip(f - half, 0.0, 1.0), np.clip(f + half, 0.0, 1.0)))
+    return bands
+
+
 def _predict_empirical_with_ci(
     fit_result: FitResult,
     time_points: np.ndarray,
     temperature_K: float,
     bootstrap_result: Optional[BootstrapResult],
+    ci_type: str = 'two-sided',
 ) -> PredictionResult:
     """Predict an empirical curve and propagate bootstrap parameter uncertainty."""
     time_points = np.asarray(time_points, dtype=float)
@@ -152,13 +195,20 @@ def _predict_empirical_with_ci(
 
             valid_curves = np.any(np.isfinite(replicate_curves), axis=1)
             if np.any(valid_curves):
-                tail = (1.0 - bootstrap_result.confidence_level) / 2.0
+                level = bootstrap_result.confidence_level
                 with warnings.catch_warnings():
                     warnings.simplefilter('ignore', category=RuntimeWarning)
-                    conversion_ci = (
-                        np.nanpercentile(replicate_curves[valid_curves], tail * 100.0, axis=0),
-                        np.nanpercentile(replicate_curves[valid_curves], (1.0 - tail) * 100.0, axis=0),
-                    )
+                    if ci_type == 'one-sided':
+                        conversion_ci = (
+                            np.asarray(conversion, dtype=float),
+                            np.nanpercentile(replicate_curves[valid_curves], level * 100.0, axis=0),
+                        )
+                    else:
+                        tail = (1.0 - level) / 2.0
+                        conversion_ci = (
+                            np.nanpercentile(replicate_curves[valid_curves], tail * 100.0, axis=0),
+                            np.nanpercentile(replicate_curves[valid_curves], (1.0 - tail) * 100.0, axis=0),
+                        )
 
     return PredictionResult(
         time=time_points,
@@ -363,7 +413,7 @@ def _get_smart_initial_guess(
             model_name='single_step',
             model_definition_args={'f_alpha_model': 'F1'},
             initial_guesses={'Ea': 80000, 'A': 1e12},
-            parameter_bounds={'Ea': (10000, 300000), 'A': (1e3, 1e25)}
+            parameter_bounds={'Ea': EA_BOUNDS, 'A': (1e3, 1e25)}
         )
 
         if quick_fit.success:
@@ -379,6 +429,49 @@ def _get_smart_initial_guess(
 
     # Fallback to defaults
     return {'Ea': 80000, 'A': 1e12}
+
+
+def _sb2_arrhenius_starts(datasets: List[KineticDataset]) -> List[Dict[str, float]]:
+    """Starting (Ea, A) pairs for the two SB2 steps, from zero-order fits of the data.
+
+    The slow step is seeded from the datasets that barely react and the fast, steep
+    step from the ones that do; both step orderings are returned because grid steps
+    with different (m, n) are not interchangeable.
+    """
+    def f0(subset):
+        fit = fit_kinetic_model(subset, 'single_step', {'f_alpha_model': 'F0'},
+                                {'Ea': 80e3, 'A': 1e6}, verbose=False)
+        return fit if fit.success else None
+
+    low = [d for d in datasets if len(d.conversion) and d.conversion.max() < 0.2]
+    high = [d for d in datasets if len(d.conversion) and d.conversion.max() >= 0.2]
+    slow = f0(low) if len(low) >= 2 else None
+    slow = slow or f0(datasets)
+    if slow is None:
+        return []
+    fast = (f0(high) if high else None) or slow
+    T_hot = float(np.mean([d.temperature.mean() for d in (high or datasets)]))
+    k_hot = fast.parameters['A'] * np.exp(-fast.parameters['Ea'] / (R_GAS * T_hot))
+    Ea_fast = 0.6 * EA_BOUNDS[1]
+    steep = {'Ea': Ea_fast, 'A': k_hot * np.exp(Ea_fast / (R_GAS * T_hot))}
+    shallow = {'Ea': float(np.clip(slow.parameters['Ea'], *EA_BOUNDS)), 'A': slow.parameters['A']}
+    return [{'Ea1': a['Ea'], 'A1': a['A'], 'Ea2': b['Ea'], 'A2': b['A']}
+            for a, b in ((steep, shallow), (shallow, steep))]
+
+
+def _fit_sb2(datasets: List[KineticDataset], model_definition_args: Dict, initial_guesses: Dict[str, float],
+             parameter_bounds: Dict[str, Tuple[float, float]], progress: Optional[Callable] = None) -> FitResult:
+    """Fit an SB2 model from data-driven starts (both step orderings) plus the default guess; keep the best AIC."""
+    starts = [dict(initial_guesses, **s) for s in _sb2_arrhenius_starts(datasets)] + [dict(initial_guesses)]
+    best, last = None, None
+    for guess in starts:
+        fit = fit_kinetic_model(datasets, 'SB2', model_definition_args, guess, parameter_bounds, verbose=False)
+        last = fit
+        if fit.success and np.isfinite(fit.aic) and (best is None or fit.aic < best.aic):
+            best = fit
+    if progress and best is not None:
+        progress(f"  SB2: best of {len(starts)} starts, R²={best.r_squared:.4f}", {})
+    return best if best is not None else last
 
 
 def _multistart_fit(
@@ -533,7 +626,7 @@ def _setup_model_configs(
         default_guess = {'Ea': 80000, 'A': 1e12}  # 80 kJ/mol, typical pre-exponential
 
     default_bounds = {
-        'Ea': (10000, 300000),  # 10-300 kJ/mol
+        'Ea': EA_BOUNDS,
         'A': (1e3, 1e20)  # Reasonable range for pre-exponential (log(A) = 6.9 to 46)
     }
 
@@ -561,25 +654,44 @@ def _setup_model_configs(
             if model_name == 'First_Order':
                 initial_guesses_pool[model_key] = {'Ea': ea_guess, 'A': a_guess, 'A_scale': 1.0}
                 bounds_pool[model_key] = {
-                    'Ea': (1000, 500000), 'A': (1e-5, 1e20), 'A_scale': (0.0, 10.0)
+                    'Ea': EA_BOUNDS, 'A': (1e-5, 1e20), 'A_scale': (0.0, 10.0)
                 }
             elif model_name in ['Linear', 'Sqrt']:
                 initial_guesses_pool[model_key] = {'Ea': ea_guess, 'A': a_guess, 'C': 0.0}
                 bounds_pool[model_key] = {
-                    'Ea': (1000, 500000), 'A': (1e-5, 1e20), 'C': (-1.0, 1.0)
+                    'Ea': EA_BOUNDS, 'A': (1e-5, 1e20), 'C': (-1.0, 1.0)
                 }
             elif model_name == 'Logistic':
                 initial_guesses_pool[model_key] = {'Ea': ea_guess, 'A': a_guess, 'A_max': 1.0, 'B': 1.0}
                 bounds_pool[model_key] = {
-                    'Ea': (1000, 500000), 'A': (1e-5, 1e20),
+                    'Ea': EA_BOUNDS, 'A': (1e-5, 1e20),
                     'A_max': (0.0, 10.0), 'B': (0.01, 100.0)
                 }
             elif model_name == 'Exponential':
                 initial_guesses_pool[model_key] = {'Ea': ea_guess, 'A': a_guess, 'A_amp': 1.0, 'C': 0.0}
                 bounds_pool[model_key] = {
-                    'Ea': (1000, 500000), 'A': (1e-5, 1e20),
+                    'Ea': EA_BOUNDS, 'A': (1e-5, 1e20),
                     'A_amp': (0.0, 10.0), 'C': (-1.0, 1.0)
                 }
+            continue
+
+        sb2_fixed = parse_sb2_model(model_name)
+        if model_name == 'SB2' or sb2_fixed:
+            model_key = f'{model_name}_model'
+            sb2_params = ({} if sb2_fixed is None else
+                          dict(zip(('m1', 'n1', 'm2', 'n2'), (float(v) for v in sb2_fixed))))
+            models_config.append({'name': model_key, 'type': 'SB2', 'def_args': {'sb2_params': sb2_params}})
+            ea_guess = default_guess.get('Ea', 80000)
+            a_guess = default_guess.get('A', 1e12)
+            # Step 1 starts steep (high Ea) and step 2 shallow, so the two steps can separate.
+            guesses = {'Ea1': min(ea_guess * 2.0, EA_BOUNDS[1] * 0.9), 'A1': a_guess,
+                       'Ea2': max(ea_guess * 0.75, EA_BOUNDS[0] * 2), 'A2': a_guess}
+            step_bounds = {'Ea1': EA_BOUNDS, 'A1': SB2_A_BOUNDS, 'Ea2': EA_BOUNDS, 'A2': SB2_A_BOUNDS}
+            if sb2_fixed is None:
+                guesses.update({'m1': 0.5, 'n1': 1.0, 'm2': 0.0, 'n2': 1.0})
+                step_bounds.update({'m1': (0.0, 3.0), 'n1': (0.0, 8.0), 'm2': (0.0, 3.0), 'n2': (0.0, 8.0)})
+            initial_guesses_pool[model_key] = guesses
+            bounds_pool[model_key] = step_bounds
             continue
 
         # Check if it's an ODE model (contains special characters)
@@ -606,8 +718,8 @@ def _setup_model_configs(
                     'Ea2': ea_guess * 1.25, 'A2': a_guess * 10  # Second step slightly higher
                 }
                 bounds_pool[model_key] = {
-                    'Ea1': (10000, 300000), 'A1': (1e3, 1e20),
-                    'Ea2': (10000, 300000), 'A2': (1e3, 1e20)
+                    'Ea1': EA_BOUNDS, 'A1': (1e3, 1e20),
+                    'Ea2': EA_BOUNDS, 'A2': (1e3, 1e20)
                 }
             elif model_name == 'A+B->C':
                 # Bimolecular reaction (with tighter bounds for stability)
@@ -621,12 +733,17 @@ def _setup_model_configs(
                 a_guess = default_guess.get('A', 1e12)
                 initial_guesses_pool[model_key] = {'Ea': ea_guess, 'A': a_guess}
                 bounds_pool[model_key] = {
-                    'Ea': (10000, 250000),
+                    'Ea': EA_BOUNDS,
                     'A': (1e6, 1e18),
                 }
         else:
             # f(alpha) model
             model_key = f'{model_name}_model'
+
+            # Check if it's a grid SB model: SB_m{m}_n{n}
+            import re
+            sb_match = re.match(r'SB_m(\d+)_n(\d+)', model_name)
+
             models_config.append({
                 'name': model_key,
                 'type': 'single_step',
@@ -656,6 +773,10 @@ def _setup_model_configs(
                 bounds['m'] = (0.0, 3.0)
                 bounds['n'] = (0.0, 3.0)
                 bounds['p'] = (-2.0, 2.0)  # p can be positive or negative
+            elif sb_match:
+                # Grid SB model: m and n are FIXED (not fitted), no additional params
+                # Just use base Ea/A guesses and bounds
+                pass
 
             initial_guesses_pool[model_key] = guesses
             bounds_pool[model_key] = bounds
@@ -1197,7 +1318,7 @@ def _simplicity_key(model: Dict) -> Tuple[int, int]:
 
 
 # Plausible range for drug degradation mechanisms (hydrolysis, oxidation, thermolysis).
-# Narrower than core.py's generic overflow-prevention bounds (5-400 kJ/mol) -- this is
+# Narrower than the EA_BOUNDS fitting range (5-1000 kJ/mol) -- this is
 # a domain-specific plausibility check for stability studies, not a numerical-stability one.
 TYPICAL_EA_RANGE_J_MOL = (30_000.0, 180_000.0)
 
@@ -1315,15 +1436,38 @@ def _bootstrap_results_by_display_name(
 
 
 def _select_simplest_equivalent(ranked_models: List[Dict]) -> Tuple[Dict, str]:
-    """Among models whose BIC is within INDISTINGUISHABLE_DELTA_BIC of the best, pick the simplest."""
-    best_bic = min(m['stats']['bic'] for m in ranked_models)
-    tied = [m for m in ranked_models if m['stats']['bic'] - best_bic < INDISTINGUISHABLE_DELTA_BIC]
-    chosen = min(tied, key=_simplicity_key)
-    if len(tied) == 1:
-        return chosen, "Best BIC; no other model is statistically equivalent"
-    names = ', '.join(m['model_name'].replace('_model', '') for m in tied)
-    return chosen, (f"Simplest of {len(tied)} statistically indistinguishable models "
-                    f"(ΔBIC < {INDISTINGUISHABLE_DELTA_BIC:g}): {names}")
+    """
+    Select the best model from ranked list.
+
+    With Akaike-only ranking, simply returns the top-ranked model (rank 1).
+    Akaike weights already optimally balance fit quality and complexity.
+    """
+    if not ranked_models:
+        raise ValueError(
+            "No valid models available for selection. All models failed ranking criteria. "
+            "This may indicate insufficient data, data quality issues, or overly strict filtering. "
+            "Try: (1) collecting more data, (2) disabling filters with apply_filters=False, "
+            "or (3) lowering min_r_squared threshold."
+        )
+
+    # With Akaike weights, rank 1 is always the best choice
+    # No need for "simplicity" selection - Akaike already handles complexity optimally
+    chosen = ranked_models[0]  # Already sorted by Akaike weight
+
+    # Build reason string
+    akaike_wt = chosen['stats'].get('akaike_weight', 0.0)
+    if akaike_wt >= 0.90:
+        reason = f"Overwhelming evidence (Akaike weight = {akaike_wt:.1%})"
+    elif akaike_wt >= 0.70:
+        reason = f"Strong evidence (Akaike weight = {akaike_wt:.1%})"
+    elif akaike_wt >= 0.50:
+        reason = f"Substantial support (Akaike weight = {akaike_wt:.1%})"
+    else:
+        # Model uncertainty exists
+        n_competitive = sum(1 for m in ranked_models[:5] if m['stats'].get('akaike_weight', 0) > 0.10)
+        reason = f"Best of {n_competitive} competitive models (Akaike weight = {akaike_wt:.1%})"
+
+    return chosen, reason
 
 
 def auto_model_isothermal_data(
@@ -1342,6 +1486,7 @@ def auto_model_isothermal_data(
     initial_ratio_r: float = 1.0,
     bootstrap_iterations: int = 100,
     confidence_level: float = 0.95,
+    ci_type: str = 'two-sided',
     filter_implausible: bool = False,
     report_format: str = "interactive",
     report_path: Optional[Union[str, Path]] = None,
@@ -1356,6 +1501,12 @@ def auto_model_isothermal_data(
     shelf_life_confidence_level: float = 0.95,
     shelf_life_is_long_term: bool = True,
     shelf_life_nonlinearity_p_threshold: float = 0.05,
+    attribute_direction: Optional[str] = None,
+    calculate_shelf_life_ich_q1e_method: bool = True,
+    shelf_life_specification_limit: float = 0.05,
+    average_replicates: bool = False,  # Temporarily disabled by default - needs more testing
+    min_r_squared: float = 0.70,
+    apply_filters: bool = True,
     **loader_kwargs
 ) -> Union[Dict, str, Tuple[Dict, str]]:
     """
@@ -1444,11 +1595,32 @@ def auto_model_isothermal_data(
     shelf_life_nonlinearity_p_threshold : float, default=0.05
         Select a quadratic trend when its nested F-test against a linear trend has
         a p-value below this threshold.
+    attribute_direction : str, optional
+        Direction of attribute change for ICH Q1E compliance:
+        - 'decreasing': For potency, monomer content (quality decreases over time)
+        - 'increasing': For aggregates, impurities (degradants increase over time)
+        If None (default), automatically inferred from readout_type in loader_kwargs:
+        - readout_type='decreasing' → attribute_direction='decreasing'
+        - readout_type='increasing' → attribute_direction='increasing'
+        Determines which confidence bound to use for conservative shelf-life estimates.
+    calculate_shelf_life_ich_q1e_method : bool, default=True
+        If True (default), calculate ICH Q1E-compliant shelf-life using confidence-band
+        crossing method. Requires bootstrap confidence intervals. Returns conservative
+        shelf-life estimate where the appropriate one-sided 95% CI bound crosses the
+        specification limit. Set to False to disable ICH Q1E calculation.
+    shelf_life_specification_limit : float, default=0.05
+        Specification limit for ICH Q1E shelf-life calculation (e.g., 0.05 for 5% degradation,
+        0.10 for 10% degradation). Should be specified as conversion/degradation level (0-1 range).
+        Default of 0.05 (5%) is commonly used for protein aggregation and general degradation.
     confidence_level : float, default=0.95
         Confidence level for intervals (0.95 = 95%)
+    ci_type : str, default='two-sided'
+        Band shown for bootstrap predictions/simulations: 'two-sided' (equal-tailed,
+        e.g. [2.5th, 97.5th]) or 'one-sided' ((MLE, 95th)). The ICH Q1E bootstrap
+        shelf-life always uses the one-sided 95th-percentile bound regardless.
     filter_implausible : bool, default=False
         If True, exclude models with physically implausible parameters from ranking.
-        Uses permissive bounds (Ea: 10-400 kJ/mol, A: 10^-2 to 10^25 s^-1) to catch
+        Uses permissive bounds (Ea: 5-1000 kJ/mol, A: 10^-2 to 10^25 s^-1) to catch
         only clearly unphysical values. Implausible models are still fitted but won't
         appear in top_models or be selected. Useful for avoiding unrealistic extrapolations.
     report_format : str, default='interactive'
@@ -1544,7 +1716,8 @@ def auto_model_isothermal_data(
         else:
             # File path
             filepath = Path(data_source)
-            dataset = load_data_file(filepath, **loader_kwargs)
+            # Explicitly pass average_replicates (defaults to True)
+            dataset = load_data_file(filepath, average_replicates=average_replicates, **loader_kwargs)
             datasets.append(dataset)
             progress(f"Loaded dataset {i+1}/{len(data_files)}: {filepath.name}",
                     {'file_index': i+1, 'total_files': len(data_files), 'filename': filepath.name})
@@ -1552,7 +1725,14 @@ def auto_model_isothermal_data(
     if not datasets:
         raise ValueError("No datasets were successfully loaded")
 
-    _harmonize_loaded_datasets(datasets, loader_kwargs.get('readout_type', 'increasing'), progress)
+    _harmonize_loaded_datasets(datasets, loader_kwargs.get('readout_type', 'increasing'), progress,
+                               loader_kwargs.get('readout_initial'), loader_kwargs.get('readout_final'))
+
+    # Auto-detect attribute_direction from readout_type if not specified
+    if attribute_direction is None:
+        readout_type = loader_kwargs.get('readout_type', 'increasing')
+        attribute_direction = readout_type  # 'decreasing' or 'increasing'
+        progress(f"Auto-detected attribute_direction='{attribute_direction}' from readout_type", {})
 
     # Convert input temperatures to Kelvin if needed
     if input_temperature_units.upper() != 'K':
@@ -1589,7 +1769,7 @@ def auto_model_isothermal_data(
 
     # Get smart initial guesses if ODE models are included
     smart_guess = None
-    has_ode = any('->' in m or '+' in m for m in models_to_try)
+    has_ode = any('->' in m or '+' in m or m == 'SB2' or parse_sb2_model(m) for m in models_to_try)
     if has_ode and len(datasets) > 0:
         progress("Getting smart initial guesses for ODE models...", {})
         smart_guess = _get_smart_initial_guess(datasets, progress)
@@ -1635,6 +1815,9 @@ def auto_model_isothermal_data(
                     message=f"Empirical fit failed: {e}",
                     rss=np.inf, n_datapoints=0, n_parameters=0
                 )
+        elif model_info['type'] == 'SB2':
+            fit_res = _fit_sb2(datasets, model_info['def_args'], initial_guesses[custom_name],
+                               bounds.get(custom_name), progress)
         elif model_info['type'] == 'Friedman':
             progress("  Running Friedman isoconversional analysis (model-free)...", {})
             try:
@@ -1739,8 +1922,12 @@ def auto_model_isothermal_data(
             warnings.warn("All models have implausible parameters; disabling filter")
             fit_results_to_rank = all_fit_results
 
-    # Rank the models
-    ranked_models = rank_models(fit_results_to_rank)
+    # Rank the models using Akaike weights (only ranking method)
+    ranked_models = rank_models(
+        fit_results_to_rank,
+        min_r_squared=min_r_squared,
+        apply_filters=apply_filters
+    )
 
     # Add custom names to ranked results
     for ranked_model in ranked_models:
@@ -1843,13 +2030,14 @@ def auto_model_isothermal_data(
                     bootstrap_result=bootstrap_results.get(top_fit_results[0].model_name),
                 )
             else:
-                # Use mechanistic prediction
                 pred_result = predict_conversion(
                     kinetic_description=top_fit_results[0],
                     temperature_program=lambda t: temp_K,
                     simulation_time_sec=time_eval,
                     initial_alpha=0.0,
-                    bootstrap_result=bootstrap_results.get(top_fit_results[0].model_name)
+                    bootstrap_result=bootstrap_results.get(top_fit_results[0].model_name),
+                    attribute_direction=attribute_direction,
+                    ci_type=ci_type
                 )
 
             # Store the PredictionResult for regulatory plots
@@ -1875,6 +2063,59 @@ def auto_model_isothermal_data(
 
             progress(f"Prediction for {pred_value} {pred_unit} at {temp_output:.1f} {output_temperature_units}: {pred_result.conversion[-1]:.2%} conversion",
                     {'time_value': pred_value, 'time_unit': pred_unit, 'temperature': temp_output, 'temperature_units': output_temperature_units})
+
+            # Calculate ICH Q1E-compliant shelf-life if requested
+            if calculate_shelf_life_ich_q1e_method:
+                if shelf_life_specification_limit is None:
+                    warnings.warn(
+                        "calculate_shelf_life_ich_q1e_method=True but shelf_life_specification_limit not provided. "
+                        "Skipping ICH Q1E shelf-life calculation."
+                    )
+                elif pred_result.conversion_ci is None:
+                    warnings.warn(
+                        "ICH Q1E shelf-life calculation requires bootstrap confidence intervals. "
+                        "Set bootstrap_iterations > 0 to enable."
+                    )
+                else:
+                    try:
+                        progress("Calculating ICH Q1E-compliant shelf-life...", {'step': '6c'})
+                        # ICH Q1E needs the one-sided bound, independent of the plotted band.
+                        q1e_pred = pred_result
+                        if top_fit_results[0].model_name.startswith('Empirical_'):
+                            q1e_pred = _predict_empirical_with_ci(
+                                fit_result=top_fit_results[0], time_points=time_eval,
+                                temperature_K=temp_K,
+                                bootstrap_result=bootstrap_results.get(top_fit_results[0].model_name),
+                                ci_type='one-sided',
+                            )
+                        elif ci_type != 'one-sided':
+                            q1e_pred = predict_conversion(
+                                kinetic_description=top_fit_results[0],
+                                temperature_program=lambda t: temp_K,
+                                simulation_time_sec=time_eval,
+                                initial_alpha=0.0,
+                                bootstrap_result=bootstrap_results.get(top_fit_results[0].model_name),
+                                attribute_direction=attribute_direction,
+                                ci_type='one-sided',
+                            )
+                        shelf_life_result = time_to_specification(
+                            q1e_pred,
+                            specification_limit=shelf_life_specification_limit,
+                            attribute_direction=attribute_direction
+                        )
+                        # Convert shelf-life from seconds to requested unit
+                        shelf_life_in_unit = shelf_life_result['shelf_life_ich_q1e'] / TIME_UNITS[pred_unit.lower()]
+                        shelf_life_mean_in_unit = shelf_life_result['shelf_life_mean'] / TIME_UNITS[pred_unit.lower()]
+
+                        predictions_dict['shelf_life_ich_q1e'] = shelf_life_result
+                        progress(
+                            f"ICH Q1E shelf-life: {shelf_life_in_unit:.1f} {pred_unit} "
+                            f"(conservative, vs {shelf_life_mean_in_unit:.1f} {pred_unit} mean)",
+                            {'shelf_life_conservative': shelf_life_in_unit, 'shelf_life_mean': shelf_life_mean_in_unit, 'unit': pred_unit}
+                        )
+                    except Exception as e:
+                        warnings.warn(f"ICH Q1E shelf-life calculation failed: {e}")
+
         except Exception as e:
             warnings.warn(f"Prediction failed: {e}")
 
@@ -2020,7 +2261,9 @@ def auto_model_isothermal_data(
                     temperature_program=temp_program,
                     simulation_time_sec=time_eval,
                     initial_alpha=0.0,
-                    bootstrap_result=bootstrap_results.get(top_fit_results[0].model_name)
+                    bootstrap_result=bootstrap_results.get(top_fit_results[0].model_name),
+                    attribute_direction=attribute_direction,
+                    ci_type=ci_type
                 )
 
             # Convert temperatures to output units
@@ -2079,10 +2322,13 @@ def auto_model_isothermal_data(
             # Add as attributes to FitResult object (read by reporting.py)
             fit_res.conversion_simulated = simulated_conversions
             fit_res.conversion_simulated_ci = simulated_ci if any(c is not None for c in simulated_ci) else None
+            fit_res.conversion_simulated_pi = _prediction_bands(
+                datasets, simulated_conversions, simulated_ci, fit_res.n_parameters, confidence_level)
         except Exception as e:
             warnings.warn(f"Failed to simulate conversion for plotting: {e}")
             fit_res.conversion_simulated = None
             fit_res.conversion_simulated_ci = None
+            fit_res.conversion_simulated_pi = None
 
     # Step 8: Generate summary
     actual_bootstrap_iters = 0
@@ -2156,6 +2402,7 @@ def auto_model_isothermal_data(
         'bootstrap_results': _bootstrap_results_by_display_name(bootstrap_results, fit_result_names),
         'summary': summary,
         'regulatory': regulatory_results,  # Shelf-life trend estimate
+        'attribute_direction': attribute_direction,  # Auto-detected or user-specified
         # Additional objects for advanced users
         'datasets': datasets,  # Original datasets for custom plotting
         'fit_results': fit_result_names,  # FitResult objects by model name

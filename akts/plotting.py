@@ -98,10 +98,11 @@ def plot_fit_overlay(
     figsize: Tuple[float, float] = (10, 6),
     time_units: str = 'seconds',
     ax: Optional[plt.Axes] = None,
-    show_ci: bool = True
+    show_ci: bool = True,
+    show_pi: bool = True,
 ) -> Figure:
     """
-    Plot experimental data with model fit overlay and optional confidence intervals.
+    Plot experimental data with model fit overlay and optional confidence/prediction bands.
 
     Parameters
     ----------
@@ -120,6 +121,9 @@ def plot_fit_overlay(
         Existing axes to plot on
     show_ci : bool, default=True
         If True and prediction has CI bands, display them as shaded region
+    show_pi : bool, default=True
+        If True, also shade a 95% prediction interval: the CI widened by the pooled
+        residual scatter of the data around each series' prediction.
 
     Returns
     -------
@@ -156,6 +160,7 @@ def plot_fit_overlay(
 
     colors = plt.get_cmap('tab10')(np.linspace(0, 1, max(len(datasets), 1)))
     has_any_ci = False
+    pi_bands = _prediction_interval_bands(datasets, predictions, fit_result) if show_pi and predictions else None
 
     # Plot each experimental series and its corresponding fit and CI.
     for index, ds in enumerate(datasets):
@@ -188,6 +193,10 @@ def plot_fit_overlay(
                   show_ci and
                   len(series_prediction.conversion_ci) == 2)
 
+        if pi_bands is not None and pi_bands[index] is not None:
+            ax.fill_between(prediction_time_plot, pi_bands[index][0] * 100, pi_bands[index][1] * 100,
+                            alpha=0.1, color=color, linewidth=0, label=f'95% PI at {temp_C:.0f}°C')
+
         if has_ci:
             ci_lower_pct = series_prediction.conversion_ci[0] * 100
             ci_upper_pct = series_prediction.conversion_ci[1] * 100
@@ -214,7 +223,9 @@ def plot_fit_overlay(
     ax.set_xlabel(f'Time ({time_units})', fontsize=12, fontweight='bold')
     ax.set_ylabel('Degradation (%)', fontsize=12, fontweight='bold')
     title = 'Experimental Data vs Model Fit'
-    if has_any_ci:
+    if has_any_ci and pi_bands is not None:
+        title += ' with 95% CI and PI'
+    elif has_any_ci:
         title += ' with 95% CI'
     ax.set_title(title, fontsize=14, fontweight='bold')
     ax.legend(loc='best', fontsize=9, framealpha=0.9)
@@ -222,6 +233,31 @@ def plot_fit_overlay(
 
     plt.tight_layout()
     return fig
+
+
+def _prediction_interval_bands(datasets, predictions, fit_result, confidence_level: float = 0.95):
+    """Per-series (lower, upper) PI: t * sqrt(se_fit^2 + s_i^2), s_i^2 = that series' residual variance."""
+    from scipy.stats import t as t_dist
+    residuals = []
+    for ds, pred in zip(datasets, predictions):
+        at_data = np.interp(ds.time, pred.time, pred.conversion)
+        r = np.asarray(ds.conversion, float) - at_data
+        residuals.append(r[np.isfinite(r)])
+    n_total = sum(r.size for r in residuals)
+    dof = n_total - int(getattr(fit_result, 'n_parameters', 0) or 0)
+    if dof < 1:
+        return None
+    t_crit = float(t_dist.ppf(0.5 + confidence_level / 2.0, dof))
+    z = float(t_dist.ppf(0.5 + confidence_level / 2.0, 1e9))
+    bands = []
+    for r, pred in zip(residuals, predictions):
+        s2 = float(np.sum(r ** 2) / (r.size * dof / n_total)) if r.size else 0.0
+        mean = np.asarray(pred.conversion, float)
+        ci = pred.conversion_ci
+        se_fit = np.zeros_like(mean) if ci is None else (np.asarray(ci[1]) - np.asarray(ci[0])) / (2.0 * z)
+        half = t_crit * np.sqrt(se_fit ** 2 + s2)
+        bands.append((np.clip(mean - half, 0.0, 1.0), np.clip(mean + half, 0.0, 1.0)))
+    return bands
 
 
 def plot_bootstrap_ci_bands(
